@@ -13,27 +13,15 @@ pub const RULE_CONTAINER_COUNT_MISMATCH: &str = "RULE_09_CONTAINER_COUNT_MISMATC
 pub const RULE_MISSING_SUPPORT: &str = "RULE_07_MISSING_SUPPORT";
 pub const RULE_DUPLICATE_CHARGE: &str = "RULE_05_DUPLICATE_CHARGE";
 pub const RULE_WASTE_STREAM_MISMATCH: &str = "RULE_08_WASTE_STREAM_MISMATCH";
+pub const RULE_UNIT_MISMATCH: &str = "RULE_10_UNIT_MISMATCH";
 
 pub fn check_rate_and_fees(invoice: &Invoice, rate: &ContractRate) -> Vec<DiscrepancyLine> {
     let mut out = Vec::new();
+
     for line in &invoice.line_items {
-        if line.unit == rate.unit && line.fee_code.is_none() {
-            if line.unit_price != rate.unit_rate {
-                let expected_line_total = rate.unit_rate * line.quantity;
-                let diff = line.line_total - expected_line_total;
-                out.push(DiscrepancyLine {
-                    discrepancy_type: DiscrepancyType::RateMismatch,
-                    description: format!(
-                        "Invoiced at {}/{} but contracted rate is {}/{} (qty {})",
-                        line.unit_price, rate.unit, rate.unit_rate, rate.unit, line.quantity
-                    ),
-                    amount: diff,
-                    rule_id: RULE_RATE_MISMATCH.to_string(),
-                    confidence: Confidence::High,
-                });
-            }
-        } else if let Some(fee_code) = &line.fee_code {
+        if let Some(fee_code) = &line.fee_code {
             let authorized = rate.authorized_fees.iter().find(|f| &f.fee_code == fee_code);
+
             match authorized {
                 None => {
                     out.push(DiscrepancyLine {
@@ -62,26 +50,109 @@ pub fn check_rate_and_fees(invoice: &Invoice, rate: &ContractRate) -> Vec<Discre
                 }
                 Some(_) => {}
             }
+
+            continue;
+        }
+
+        // Units must match before a contract rate can be compared with an invoice line.
+        // No conversion is inferred: a quantity in kg cannot be priced using a rate per drum.
+        if !same_text(&line.unit, &rate.unit) {
+            out.push(DiscrepancyLine {
+                discrepancy_type: DiscrepancyType::Other,
+                description: format!(
+                    "Invoice line '{}' uses unit '{}' but the contract rate is per '{}'; no unit conversion is configured, so the line cannot be priced reliably",
+                    line.description, line.unit, rate.unit
+                ),
+                amount: Money::zero(),
+                rule_id: RULE_UNIT_MISMATCH.to_string(),
+                confidence: Confidence::Medium,
+            });
+            continue;
+        }
+
+        if line.unit_price != rate.unit_rate {
+            let expected_line_total = rate.unit_rate * line.quantity;
+            let diff = line.line_total - expected_line_total;
+
+            out.push(DiscrepancyLine {
+                discrepancy_type: DiscrepancyType::RateMismatch,
+                description: format!(
+                    "Invoiced at {}/{} but contracted rate is {}/{} (qty {})",
+                    line.unit_price, line.unit, rate.unit_rate, rate.unit, line.quantity
+                ),
+                amount: diff,
+                rule_id: RULE_RATE_MISMATCH.to_string(),
+                confidence: Confidence::High,
+            });
         }
     }
+
     out
 }
 
-pub fn check_quantity_vs_manifest(invoice: &Invoice, manifest: &Manifest, tol: &Tolerances) -> Option<DiscrepancyLine> {
-    let invoice_qty: Decimal = invoice.line_items.iter().filter(|l| l.fee_code.is_none()).map(|l| l.quantity).sum();
+pub fn check_quantity_vs_manifest(
+    invoice: &Invoice,
+    manifest: &Manifest,
+    tol: &Tolerances,
+) -> Option<DiscrepancyLine> {
+    let primary_lines: Vec<&InvoiceLineItem> = invoice
+        .line_items
+        .iter()
+        .filter(|line| line.fee_code.is_none())
+        .collect();
+
+    let matching_lines: Vec<&InvoiceLineItem> = primary_lines
+        .iter()
+        .copied()
+        .filter(|line| same_text(&line.unit, &manifest.unit))
+        .collect();
+
+    // If none of the invoice's primary lines use the manifest's unit,
+    // comparing the numeric quantities would be misleading.
+    if !primary_lines.is_empty() && matching_lines.is_empty() {
+        let units = primary_lines
+            .iter()
+            .map(|line| line.unit.trim())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        return Some(DiscrepancyLine {
+            discrepancy_type: DiscrepancyType::Other,
+            description: format!(
+                "Invoice primary line unit(s) [{}] cannot be compared with manifest #{} unit '{}'; no unit conversion is configured",
+                units, manifest.manifest_number, manifest.unit
+            ),
+            amount: Money::zero(),
+            rule_id: RULE_UNIT_MISMATCH.to_string(),
+            confidence: Confidence::Medium,
+        });
+    }
+
+    let invoice_qty: Decimal = matching_lines
+        .iter()
+        .map(|line| line.quantity)
+        .sum();
+
     let diff = (invoice_qty - manifest.quantity).abs();
+
     if diff > tol.quantity_tolerance {
         Some(DiscrepancyLine {
             discrepancy_type: DiscrepancyType::QuantityMismatch,
             description: format!(
-                "Invoice quantity {} does not match manifest quantity {} (manifest #{})",
-                invoice_qty, manifest.quantity, manifest.manifest_number
+                "Invoice quantity {} {} does not match manifest quantity {} {} (manifest #{})",
+                invoice_qty,
+                manifest.unit,
+                manifest.quantity,
+                manifest.unit,
+                manifest.manifest_number
             ),
             amount: Money::zero(),
             rule_id: RULE_QUANTITY_VS_MANIFEST.to_string(),
             confidence: Confidence::High,
         })
-    } else { None }
+    } else {
+        None
+    }
 }
 
 pub fn check_weight_mismatch(invoice_weight: Decimal, ticket: &WeightTicket, tol: &Tolerances) -> Option<DiscrepancyLine> {
@@ -164,7 +235,7 @@ fn lines_identical(a: &InvoiceLineItem, b: &InvoiceLineItem) -> bool {
 /// Dollar amount RULE_03/RULE_04 already attribute to this exact line (signed).
 fn already_attributed(line: &InvoiceLineItem, rate: Option<&ContractRate>) -> Money {
     let Some(rate) = rate else { return Money::zero() };
-    if line.unit == rate.unit && line.fee_code.is_none() {
+    if same_text(&line.unit, &rate.unit) && line.fee_code.is_none() {
         if line.unit_price != rate.unit_rate { line.line_total - rate.unit_rate * line.quantity } else { Money::zero() }
     } else if let Some(code) = &line.fee_code {
         match rate.authorized_fees.iter().find(|f| &f.fee_code == code) {
@@ -326,6 +397,58 @@ mod tests {
         let rate_line = discrepancies.iter().find(|d| d.discrepancy_type == DiscrepancyType::RateMismatch).unwrap();
         assert!(rate_line.amount.is_negative(), "underbilling should produce a negative discrepancy amount");
         assert_eq!(rate_line.amount, Money::from_str_exact("-500.00").unwrap());
+    }
+    
+    #[test]
+    fn primary_rate_unit_mismatch_is_flagged_without_inventing_dollar_amount() {
+        let rate = sample_rate();
+        let mut invoice = sample_invoice_with_overcharge();
+        invoice.line_items[0].unit = "kg".into();
+
+        let findings = check_rate_and_fees(&invoice, &rate);
+
+        let finding = findings
+            .iter()
+            .find(|d| d.rule_id == RULE_UNIT_MISMATCH)
+            .expect("incompatible rate units must be flagged");
+
+        assert_eq!(finding.amount, Money::zero());
+        assert!(finding.description.contains("kg"));
+        assert!(finding.description.contains("drum"));
+        assert!(
+            !findings.iter().any(|d| d.rule_id == RULE_RATE_MISMATCH),
+            "the rate comparison must not price incompatible units"
+        );
+    }
+
+    #[test]
+    fn manifest_quantity_with_incompatible_units_is_not_compared_numerically() {
+        let mut invoice = sample_invoice_with_overcharge();
+        invoice.line_items[0].unit = "drum".into();
+
+        let manifest = Manifest {
+            id: Uuid::new_v4(),
+            organization_id: invoice.organization_id,
+            manifest_number: "M-UNIT-1".into(),
+            waste_stream: "F003".into(),
+            container_count: Some(10),
+            quantity: Decimal::from(100),
+            unit: "kg".into(),
+            shipment_date: NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+            source_document_id: None,
+        };
+
+        let finding = check_quantity_vs_manifest(
+            &invoice,
+            &manifest,
+            &Tolerances::default(),
+        )
+        .expect("incompatible units must be flagged");
+
+        assert_eq!(finding.rule_id, RULE_UNIT_MISMATCH);
+        assert_eq!(finding.amount, Money::zero());
+        assert!(finding.description.contains("drum"));
+        assert!(finding.description.contains("kg"));
     }
 
     #[test]

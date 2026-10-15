@@ -67,15 +67,32 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
     };
 
     let rate_row: Option<RateRow> = sqlx::query_as(
-        "SELECT id, vendor_id, facility_id, waste_stream, unit, unit_rate, effective_from, effective_to
-         FROM contract_rates
-         WHERE vendor_id = $1 AND waste_stream = $2
-           AND effective_from <= $3 AND (effective_to IS NULL OR effective_to >= $3)
-         ORDER BY effective_from DESC LIMIT 1",
+        r#"
+        SELECT id, vendor_id, facility_id, waste_stream, unit,
+               unit_rate, effective_from, effective_to
+        FROM contract_rates
+        WHERE vendor_id = $1
+          AND waste_stream = $2
+          AND effective_from <= $3
+          AND (facility_id IS NULL OR facility_id = $4)
+        ORDER BY
+          CASE
+            WHEN effective_to IS NULL OR effective_to >= $3 THEN 0
+            ELSE 1
+          END ASC,
+          CASE
+            WHEN $4 IS NOT NULL AND facility_id = $4 THEN 0
+            WHEN facility_id IS NULL THEN 1
+            ELSE 2
+          END ASC,
+          effective_from DESC
+        LIMIT 1
+        "#,
     )
     .bind(invoice.vendor_id)
     .bind(&invoice.waste_stream)
     .bind(invoice.service_date)
+    .bind(invoice.facility_id)
     .fetch_optional(&mut **tx)
     .await?;
 

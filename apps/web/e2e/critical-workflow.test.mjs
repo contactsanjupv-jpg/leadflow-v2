@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { chromium as pw } from "playwright-core";
+import chromiumBinary from "@sparticuz/chromium";
 
 const WEB = process.env.E2E_WEB_URL ?? "http://127.0.0.1:13000";
 const API = process.env.E2E_API_URL ?? "http://127.0.0.1:18080";
@@ -39,7 +40,17 @@ async function sendPaddleWebhook(eventType, status, customData, subId, occurredA
 }
 
 test("critical customer workflow", async (t) => {
-  const browser = await pw.launch({ args: ["--no-sandbox"], headless: true });
+  const browser =
+  process.platform === "linux"
+    ? await pw.launch({
+        args: chromiumBinary.args,
+        executablePath: await chromiumBinary.executablePath(),
+        headless: true,
+      })
+    : await pw.launch({
+        args: ["--no-sandbox"],
+        headless: true,
+      });
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 1000 }, acceptDownloads: true });
   const page = await ctx.newPage();
   page.setDefaultTimeout(20000);
