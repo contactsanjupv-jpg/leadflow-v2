@@ -53,8 +53,15 @@ impl DisputeStatus {
 pub fn transition_allowed(from: DisputeStatus, to: DisputeStatus) -> bool {
     use DisputeStatus::*;
     match (from, to) {
-        (Open, Prepare) | (Prepare, Review) | (Review, Prepare) | (Review, Submitted) | (Submitted, VendorResponded)
-        | (VendorResponded, CreditPromised) | (CreditPromised, CreditReceived) | (CreditReceived, Verified) | (Verified, Closed) => true,
+        (Open, Prepare)
+        | (Prepare, Review)
+        | (Review, Prepare)
+        | (Review, Submitted)
+        | (Submitted, VendorResponded)
+        | (VendorResponded, CreditPromised)
+        | (CreditPromised, CreditReceived)
+        | (CreditReceived, Verified)
+        | (Verified, Closed) => true,
         (Open | Prepare | Review | Submitted | VendorResponded | CreditPromised, Closed) => true,
         _ => false,
     }
@@ -65,11 +72,31 @@ mod tests {
     use super::*;
     use DisputeStatus::*;
 
-    const ALL: [DisputeStatus; 9] = [Open, Prepare, Review, Submitted, VendorResponded, CreditPromised, CreditReceived, Verified, Closed];
+    const ALL: [DisputeStatus; 9] = [
+        Open,
+        Prepare,
+        Review,
+        Submitted,
+        VendorResponded,
+        CreditPromised,
+        CreditReceived,
+        Verified,
+        Closed,
+    ];
 
     #[test]
     fn happy_path_is_allowed_step_by_step() {
-        let path = [Open, Prepare, Review, Submitted, VendorResponded, CreditPromised, CreditReceived, Verified, Closed];
+        let path = [
+            Open,
+            Prepare,
+            Review,
+            Submitted,
+            VendorResponded,
+            CreditPromised,
+            CreditReceived,
+            Verified,
+            Closed,
+        ];
         for w in path.windows(2) {
             assert!(transition_allowed(w[0], w[1]), "{:?} -> {:?}", w[0], w[1]);
         }
@@ -80,7 +107,10 @@ mod tests {
         assert!(!transition_allowed(Open, Submitted));
         assert!(!transition_allowed(Submitted, CreditPromised));
         assert!(!transition_allowed(CreditPromised, Verified));
-        assert!(!transition_allowed(CreditReceived, Closed), "a received credit must be verified before closing");
+        assert!(
+            !transition_allowed(CreditReceived, Closed),
+            "a received credit must be verified before closing"
+        );
     }
 
     #[test]
@@ -96,7 +126,13 @@ mod tests {
     #[test]
     fn only_review_can_step_back() {
         assert!(transition_allowed(Review, Prepare));
-        for from in [Submitted, VendorResponded, CreditPromised, CreditReceived, Verified] {
+        for from in [
+            Submitted,
+            VendorResponded,
+            CreditPromised,
+            CreditReceived,
+            Verified,
+        ] {
             assert!(!transition_allowed(from, Prepare));
             assert!(!transition_allowed(from, Open));
         }
@@ -104,7 +140,14 @@ mod tests {
 
     #[test]
     fn can_close_early_before_a_credit_is_received() {
-        for from in [Open, Prepare, Review, Submitted, VendorResponded, CreditPromised] {
+        for from in [
+            Open,
+            Prepare,
+            Review,
+            Submitted,
+            VendorResponded,
+            CreditPromised,
+        ] {
             assert!(transition_allowed(from, Closed), "{from:?} -> Closed");
         }
     }

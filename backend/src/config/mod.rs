@@ -23,7 +23,10 @@ pub struct Config {
 
 fn env_bool(name: &str, default: bool) -> bool {
     match env::var(name) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => default,
     }
 }
@@ -33,22 +36,43 @@ impl Config {
         let _ = dotenvy::dotenv();
         let non_empty = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
         Ok(Config {
-            database_url: env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?,
+            database_url: env::var("DATABASE_URL")
+                .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?,
             bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
-            session_ttl_hours: env::var("SESSION_TTL_HOURS").ok().and_then(|v| v.parse().ok()).unwrap_or(24 * 7),
+            session_ttl_hours: env::var("SESSION_TTL_HOURS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24 * 7),
             cors_allowed_origins: non_empty("CORS_ALLOWED_ORIGINS")
-                .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default(),
             pdftotext_path: env::var("PDFTOTEXT_PATH").unwrap_or_else(|_| "pdftotext".to_string()),
             pdf_extraction_enabled: env_bool("PDF_EXTRACTION_ENABLED", true),
             storage_dir: env::var("STORAGE_DIR").unwrap_or_else(|_| "./data/uploads".to_string()),
-            max_upload_bytes: env::var("MAX_UPLOAD_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(25 * 1024 * 1024),
+            max_upload_bytes: env::var("MAX_UPLOAD_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25 * 1024 * 1024),
             paddle_webhook_secret: non_empty("PADDLE_WEBHOOK_SECRET"),
-            paddle_signature_tolerance_secs: env::var("PADDLE_SIGNATURE_TOLERANCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300),
+            paddle_signature_tolerance_secs: env::var("PADDLE_SIGNATURE_TOLERANCE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
             billing_enforcement: env_bool("BILLING_ENFORCEMENT", true),
             worker_enabled: env_bool("WORKER_ENABLED", true),
-            worker_poll_secs: env::var("WORKER_POLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5),
-            monitor_interval_secs: env::var("MONITOR_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(900),
+            worker_poll_secs: env::var("WORKER_POLL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            monitor_interval_secs: env::var("MONITOR_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900),
         })
     }
 }

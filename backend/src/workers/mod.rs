@@ -18,7 +18,10 @@ use crate::reconciliation::service;
 pub const JOB_RECONCILE_PENDING: &str = "RECONCILE_PENDING";
 
 /// Enqueue a job unless one is already pending/running for the organization (partial unique index).
-pub async fn enqueue_reconcile_pending(tx: &mut Transaction<'_, Postgres>, organization_id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn enqueue_reconcile_pending(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+) -> Result<bool, sqlx::Error> {
     let n = sqlx::query(
         "INSERT INTO monitoring_jobs (organization_id, job_type) VALUES ($1, $2)
          ON CONFLICT (organization_id, job_type) WHERE status IN ('PENDING', 'RUNNING') DO NOTHING",
@@ -34,7 +37,10 @@ pub async fn enqueue_reconcile_pending(tx: &mut Transaction<'_, Postgres>, organ
 /// Invoices that have never been reconciled, or whose inputs (invoice, rate, manifest, weight
 /// tickets) changed after their latest reconciliation. Already-current invoices are skipped, so
 /// repeated monitoring never churns the review queue.
-pub async fn invoices_needing_reconciliation(tx: &mut Transaction<'_, Postgres>, limit: i64) -> Result<Vec<Uuid>, sqlx::Error> {
+pub async fn invoices_needing_reconciliation(
+    tx: &mut Transaction<'_, Postgres>,
+    limit: i64,
+) -> Result<Vec<Uuid>, sqlx::Error> {
     sqlx::query_scalar(
         r#"SELECT i.id FROM invoices i
            LEFT JOIN LATERAL (SELECT created_at FROM reconciliations r WHERE r.invoice_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1) lr ON true
@@ -51,7 +57,11 @@ pub async fn invoices_needing_reconciliation(tx: &mut Transaction<'_, Postgres>,
 }
 
 /// Execute one RECONCILE_PENDING job for an organization. Returns the number of invoices processed.
-pub async fn run_reconcile_pending(pool: &PgPool, organization_id: Uuid, enforce_entitlements: bool) -> Result<usize, AppError> {
+pub async fn run_reconcile_pending(
+    pool: &PgPool,
+    organization_id: Uuid,
+    enforce_entitlements: bool,
+) -> Result<usize, AppError> {
     if enforce_entitlements && !crate::billing::is_entitled(pool, organization_id).await? {
         return Ok(0); // unentitled organizations are skipped, not failed
     }
@@ -88,28 +98,45 @@ pub async fn run_reconcile_pending(pool: &PgPool, organization_id: Uuid, enforce
 
 /// Claim and execute at most one job. Returns true if a job was claimed.
 pub async fn run_one_job(pool: &PgPool, enforce_entitlements: bool) -> Result<bool, sqlx::Error> {
-    let claimed: Option<(Uuid, Uuid, String, Option<serde_json::Value>, i32)> = sqlx::query_as("SELECT job_id, org_id, job_kind, job_payload, job_attempts FROM claim_monitoring_job()").fetch_optional(pool).await?;
-    let Some((job_id, org_id, kind, _payload, _attempts)) = claimed else { return Ok(false) };
+    let claimed: Option<(Uuid, Uuid, String, Option<serde_json::Value>, i32)> = sqlx::query_as(
+        "SELECT job_id, org_id, job_kind, job_payload, job_attempts FROM claim_monitoring_job()",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some((job_id, org_id, kind, _payload, _attempts)) = claimed else {
+        return Ok(false);
+    };
     let result = match kind.as_str() {
-        JOB_RECONCILE_PENDING => run_reconcile_pending(pool, org_id, enforce_entitlements).await.map(|_| ()).map_err(|e| e.to_string()),
+        JOB_RECONCILE_PENDING => run_reconcile_pending(pool, org_id, enforce_entitlements)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
         other => Err(format!("unknown job type {other}")),
     };
     let err = result.err();
     if let Some(e) = &err {
         tracing::warn!(job_id = %job_id, error = %e, "monitoring job failed");
     }
-    sqlx::query("SELECT finish_monitoring_job($1, $2)").bind(job_id).bind(err).execute(pool).await?;
+    sqlx::query("SELECT finish_monitoring_job($1, $2)")
+        .bind(job_id)
+        .bind(err)
+        .execute(pool)
+        .await?;
     Ok(true)
 }
 
 /// Enqueue a job for every organization (scheduler tick). `organizations` has no RLS; the
 /// INSERT into monitoring_jobs goes through a tenant-scoped transaction like everything else.
 pub async fn schedule_all(pool: &PgPool) -> Result<usize, sqlx::Error> {
-    let orgs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM organizations").fetch_all(pool).await?;
+    let orgs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM organizations")
+        .fetch_all(pool)
+        .await?;
     let mut queued = 0;
     for org in orgs {
         let mut tx = crate::tenants::begin_scoped_tx(pool, org).await?;
-        if enqueue_reconcile_pending(&mut tx, org).await? { queued += 1; }
+        if enqueue_reconcile_pending(&mut tx, org).await? {
+            queued += 1;
+        }
         tx.commit().await?;
     }
     Ok(queued)

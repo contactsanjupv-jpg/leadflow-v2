@@ -47,7 +47,9 @@ pub fn transition_allowed(from: ReviewStatus, action: ReviewAction) -> bool {
     use ReviewStatus::*;
     match action {
         ReviewAction::StartReview => matches!(from, New | NeedsInformation),
-        ReviewAction::Confirm | ReviewAction::Reject | ReviewAction::NeedsInformation => matches!(from, New | UnderReview | NeedsInformation),
+        ReviewAction::Confirm | ReviewAction::Reject | ReviewAction::NeedsInformation => {
+            matches!(from, New | UnderReview | NeedsInformation)
+        }
         ReviewAction::Reopen => matches!(from, Confirmed | Rejected),
     }
 }
@@ -60,7 +62,11 @@ mod tests {
     #[test]
     fn open_findings_can_be_decided() {
         for from in [New, UnderReview, NeedsInformation] {
-            for a in [ReviewAction::Confirm, ReviewAction::Reject, ReviewAction::NeedsInformation] {
+            for a in [
+                ReviewAction::Confirm,
+                ReviewAction::Reject,
+                ReviewAction::NeedsInformation,
+            ] {
                 assert!(transition_allowed(from, a), "{from:?} -> {a:?}");
             }
         }
@@ -69,8 +75,17 @@ mod tests {
     #[test]
     fn dispute_owned_and_terminal_states_cannot_be_changed_by_hand() {
         for from in [Disputed, Resolved] {
-            for a in [ReviewAction::StartReview, ReviewAction::Confirm, ReviewAction::Reject, ReviewAction::NeedsInformation, ReviewAction::Reopen] {
-                assert!(!transition_allowed(from, a), "{from:?} -> {a:?} must be blocked");
+            for a in [
+                ReviewAction::StartReview,
+                ReviewAction::Confirm,
+                ReviewAction::Reject,
+                ReviewAction::NeedsInformation,
+                ReviewAction::Reopen,
+            ] {
+                assert!(
+                    !transition_allowed(from, a),
+                    "{from:?} -> {a:?} must be blocked"
+                );
             }
         }
     }

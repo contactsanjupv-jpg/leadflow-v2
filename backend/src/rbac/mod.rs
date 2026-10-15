@@ -50,7 +50,16 @@ mod tests {
     use super::*;
     use Permission::*;
 
-    const ALL: [Permission; 8] = [ViewData, ManageData, ReviewDiscrepancies, ManageDisputes, VerifyCredits, ManageMembers, ViewAudit, ViewBilling];
+    const ALL: [Permission; 8] = [
+        ViewData,
+        ManageData,
+        ReviewDiscrepancies,
+        ManageDisputes,
+        VerifyCredits,
+        ManageMembers,
+        ViewAudit,
+        ViewBilling,
+    ];
 
     #[test]
     fn owner_and_admin_have_every_permission() {

@@ -19,8 +19,22 @@ use crate::http::state::AppState;
 use crate::http::util::*;
 use crate::rbac::Permission;
 
-const ALLOWED_TYPES: [&str; 6] = ["INVOICE", "CONTRACT", "RATE_SHEET", "MANIFEST", "WEIGHT_TICKET", "OTHER"];
-const ALLOWED_MIME: [&str; 6] = ["application/pdf", "image/png", "image/jpeg", "text/plain", "text/csv", "image/tiff"];
+const ALLOWED_TYPES: [&str; 6] = [
+    "INVOICE",
+    "CONTRACT",
+    "RATE_SHEET",
+    "MANIFEST",
+    "WEIGHT_TICKET",
+    "OTHER",
+];
+const ALLOWED_MIME: [&str; 6] = [
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "text/plain",
+    "text/csv",
+    "image/tiff",
+];
 
 #[derive(Deserialize)]
 pub struct UploadQuery {
@@ -29,13 +43,22 @@ pub struct UploadQuery {
 }
 
 fn safe_filename(name: &str) -> String {
-    let cleaned: String = name.chars().filter(|c| !c.is_control() && *c != '/' && *c != '\\').collect();
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .collect();
     cleaned.trim().chars().take(200).collect()
 }
 
 const DOC_SQL: &str = "SELECT to_jsonb(d) FROM (SELECT id, document_type::text AS document_type, original_filename, mime_type, file_size_bytes, sha256, status::text AS status, status_detail, created_at FROM documents WHERE id = $1) d";
 
-pub async fn upload_document(user: AuthedUser, State(state): State<AppState>, Query(q): Query<UploadQuery>, headers: HeaderMap, body: Bytes) -> Result<(StatusCode, Json<Value>), AppError> {
+pub async fn upload_document(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>), AppError> {
     user.require(Permission::ManageData)?;
     let document_type = q.document_type.to_ascii_uppercase();
     if !ALLOWED_TYPES.contains(&document_type.as_str()) {
@@ -45,9 +68,19 @@ pub async fn upload_document(user: AuthedUser, State(state): State<AppState>, Qu
     if filename.is_empty() {
         return Err(AppError::Validation("filename is required".into()));
     }
-    let mime = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if !ALLOWED_MIME.contains(&mime.as_str()) {
-        return Err(AppError::Validation("unsupported content type; allowed: pdf, png, jpeg, tiff, plain text, csv".into()));
+        return Err(AppError::Validation(
+            "unsupported content type; allowed: pdf, png, jpeg, tiff, plain text, csv".into(),
+        ));
     }
     if body.is_empty() {
         return Err(AppError::Validation("file is empty".into()));
@@ -60,22 +93,39 @@ pub async fn upload_document(user: AuthedUser, State(state): State<AppState>, Qu
         "application/pdf" => body.starts_with(b"%PDF-"),
         "image/png" => body.starts_with(&[0x89, b'P', b'N', b'G']),
         "image/jpeg" => body.starts_with(&[0xFF, 0xD8, 0xFF]),
-        "image/tiff" => body.starts_with(&[b'I', b'I', 0x2A, 0x00]) || body.starts_with(&[b'M', b'M', 0x00, 0x2A]),
+        "image/tiff" => {
+            body.starts_with(&[b'I', b'I', 0x2A, 0x00])
+                || body.starts_with(&[b'M', b'M', 0x00, 0x2A])
+        }
         _ => true,
     };
     if !magic_ok {
-        return Err(AppError::Validation("file content does not match its declared content type".into()));
+        return Err(AppError::Validation(
+            "file content does not match its declared content type".into(),
+        ));
     }
-    let digest: String = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
+    let digest: String = Sha256::digest(&body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
 
     let id = Uuid::new_v4();
     let key = format!("{}/{}", user.organization_id, id);
     let mut tx = scoped_tx(&state, &user).await?;
-    let dup: Option<Uuid> = sqlx::query_scalar("SELECT id FROM documents WHERE sha256 = $1").bind(&digest).fetch_optional(&mut *tx).await?;
+    let dup: Option<Uuid> = sqlx::query_scalar("SELECT id FROM documents WHERE sha256 = $1")
+        .bind(&digest)
+        .fetch_optional(&mut *tx)
+        .await?;
     if dup.is_some() {
-        return Err(AppError::Conflict("this exact file has already been uploaded".into()));
+        return Err(AppError::Conflict(
+            "this exact file has already been uploaded".into(),
+        ));
     }
-    state.storage.put(&key, &body).await.map_err(AppError::Internal)?;
+    state
+        .storage
+        .put(&key, &body)
+        .await
+        .map_err(AppError::Internal)?;
     sqlx::query("INSERT INTO documents (id, organization_id, uploaded_by, document_type, source, object_storage_key, original_filename, mime_type, file_size_bytes, sha256, status)
                  VALUES ($1, $2, $3, $4::document_type, 'UPLOAD', $5, $6, $7, $8, $9, 'PROCESSING')")
         .bind(id).bind(user.organization_id).bind(user.user_id).bind(&document_type).bind(&key).bind(&filename).bind(&mime).bind(body.len() as i64).bind(&digest)
@@ -103,7 +153,11 @@ pub async fn upload_document(user: AuthedUser, State(state): State<AppState>, Qu
     Ok((StatusCode::CREATED, Json(out)))
 }
 
-pub async fn list_documents(user: AuthedUser, State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, AppError> {
+pub async fn list_documents(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Query(page): Query<Page>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     let v: Value = sqlx::query_scalar(
@@ -113,7 +167,11 @@ pub async fn list_documents(user: AuthedUser, State(state): State<AppState>, Que
     Ok(Json(v))
 }
 
-pub async fn get_document(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>, AppError> {
+pub async fn get_document(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     let mut doc = json_one(&mut tx, DOC_SQL, id).await?;
@@ -123,16 +181,29 @@ pub async fn get_document(user: AuthedUser, State(state): State<AppState>, Path(
     Ok(Json(doc))
 }
 
-pub async fn download_document(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Response, AppError> {
+pub async fn download_document(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
-    let row: Option<(String, String, String)> = sqlx::query_as("SELECT object_storage_key, mime_type, original_filename FROM documents WHERE id = $1").bind(id).fetch_optional(&mut *tx).await?;
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT object_storage_key, mime_type, original_filename FROM documents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let (key, mime, filename) = row.ok_or(AppError::NotFound)?;
     drop(tx);
     let bytes = state.storage.get(&key).await.map_err(AppError::Internal)?;
     let disposition = format!("attachment; filename=\"{}\"", filename.replace('"', ""));
     Ok((
-        [(header::CONTENT_TYPE, mime), (header::CONTENT_DISPOSITION, disposition), (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string())],
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
         bytes,
     )
         .into_response())
@@ -148,18 +219,47 @@ pub struct ResolveRequest {
 /// extracted, mark it PROCESSED. Linking the document as `source_document_id` on an invoice, manifest,
 /// weight ticket or contract does this automatically (`mark_used`); this endpoint covers documents
 /// that need no record. Allowed only from REVIEW_REQUIRED or FAILED.
-pub async fn resolve_document(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>, Json(req): Json<ResolveRequest>) -> Result<Json<Value>, AppError> {
+pub async fn resolve_document(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ResolveRequest>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ManageData)?;
-    let note = req.note.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(500).collect::<String>());
+    let note = req
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| n.chars().take(500).collect::<String>());
     let mut tx = scoped_tx(&state, &user).await?;
-    let cur: Option<String> = sqlx::query_scalar("SELECT status::text FROM documents WHERE id = $1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await?;
+    let cur: Option<String> =
+        sqlx::query_scalar("SELECT status::text FROM documents WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let cur = cur.ok_or(AppError::NotFound)?;
     if cur != "REVIEW_REQUIRED" && cur != "FAILED" {
-        return Err(AppError::Conflict(format!("a {cur} document does not need manual processing")));
+        return Err(AppError::Conflict(format!(
+            "a {cur} document does not need manual processing"
+        )));
     }
-    let detail = format!("processed manually{}", note.as_ref().map(|n| format!(": {n}")).unwrap_or_default());
+    let detail = format!(
+        "processed manually{}",
+        note.as_ref().map(|n| format!(": {n}")).unwrap_or_default()
+    );
     sqlx::query("UPDATE documents SET status = 'PROCESSED', status_detail = $2, updated_at = now() WHERE id = $1").bind(id).bind(&detail).execute(&mut *tx).await?;
-    audit::record(&mut tx, user.organization_id, Some(user.user_id), "document.resolve", "document", Some(id), Some(json!({ "status": cur })), Some(json!({ "status": "PROCESSED", "note": note }))).await?;
+    audit::record(
+        &mut tx,
+        user.organization_id,
+        Some(user.user_id),
+        "document.resolve",
+        "document",
+        Some(id),
+        Some(json!({ "status": cur })),
+        Some(json!({ "status": "PROCESSED", "note": note })),
+    )
+    .await?;
     let out = json_one(&mut tx, DOC_SQL, id).await?;
     tx.commit().await?;
     Ok(Json(out))

@@ -17,20 +17,36 @@ pub const WIRE_SCALE: u32 = 4;
 pub struct Money(Decimal);
 
 impl Money {
-    pub fn zero() -> Self { Money(Decimal::ZERO) }
+    pub fn zero() -> Self {
+        Money(Decimal::ZERO)
+    }
     pub fn from_str_exact(s: &str) -> Result<Self, rust_decimal::Error> {
         Ok(Money(s.parse::<Decimal>()?))
     }
-    pub fn from_decimal(d: Decimal) -> Self { Money(d) }
-    pub fn as_decimal(&self) -> Decimal { self.0 }
-    pub fn is_zero(&self) -> bool { self.0 == Decimal::ZERO }
-    pub fn is_negative(&self) -> bool { self.0 < Decimal::ZERO }
-    pub fn abs(&self) -> Self { Money(self.0.abs()) }
-    pub fn rounded_cents(&self) -> Self { Money(self.0.round_dp(2)) }
+    pub fn from_decimal(d: Decimal) -> Self {
+        Money(d)
+    }
+    pub fn as_decimal(&self) -> Decimal {
+        self.0
+    }
+    pub fn is_zero(&self) -> bool {
+        self.0 == Decimal::ZERO
+    }
+    pub fn is_negative(&self) -> bool {
+        self.0 < Decimal::ZERO
+    }
+    pub fn abs(&self) -> Self {
+        Money(self.0.abs())
+    }
+    pub fn rounded_cents(&self) -> Self {
+        Money(self.0.round_dp(2))
+    }
 
     /// Canonical wire string: always exactly `WIRE_SCALE` fractional digits, e.g. "4500.0000".
     pub fn to_wire_string(&self) -> String {
-        let rounded = self.0.round_dp_with_strategy(WIRE_SCALE, RoundingStrategy::MidpointAwayFromZero);
+        let rounded = self
+            .0
+            .round_dp_with_strategy(WIRE_SCALE, RoundingStrategy::MidpointAwayFromZero);
         format!("{:.*}", WIRE_SCALE as usize, rounded)
     }
 }
@@ -55,15 +71,21 @@ impl fmt::Display for Money {
 
 impl Add for Money {
     type Output = Money;
-    fn add(self, rhs: Self) -> Self::Output { Money(self.0 + rhs.0) }
+    fn add(self, rhs: Self) -> Self::Output {
+        Money(self.0 + rhs.0)
+    }
 }
 impl Sub for Money {
     type Output = Money;
-    fn sub(self, rhs: Self) -> Self::Output { Money(self.0 - rhs.0) }
+    fn sub(self, rhs: Self) -> Self::Output {
+        Money(self.0 - rhs.0)
+    }
 }
 impl Mul<Decimal> for Money {
     type Output = Money;
-    fn mul(self, rhs: Decimal) -> Self::Output { Money(self.0 * rhs) }
+    fn mul(self, rhs: Decimal) -> Self::Output {
+        Money(self.0 * rhs)
+    }
 }
 
 /// Request-side decimal: monetary amounts and quantities MUST arrive as decimal strings (or
@@ -74,10 +96,15 @@ impl Mul<Decimal> for Money {
 pub struct ExactDecimal(pub Decimal);
 
 impl ExactDecimal {
-    pub fn get(&self) -> Decimal { self.0 }
+    pub fn get(&self) -> Decimal {
+        self.0
+    }
 
     pub fn parse(s: &str) -> Result<Self, String> {
-        let d: Decimal = s.trim().parse().map_err(|_| format!("'{s}' is not a valid decimal number"))?;
+        let d: Decimal = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{s}' is not a valid decimal number"))?;
         Self::validate(d)
     }
 
@@ -101,9 +128,15 @@ impl<'de> Deserialize<'de> for ExactDecimal {
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a decimal string such as \"450.00\" (JSON floats are not accepted)")
             }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> { ExactDecimal::parse(v).map_err(E::custom) }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> { ExactDecimal::validate(Decimal::from(v)).map_err(E::custom) }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> { ExactDecimal::validate(Decimal::from(v)).map_err(E::custom) }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                ExactDecimal::parse(v).map_err(E::custom)
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                ExactDecimal::validate(Decimal::from(v)).map_err(E::custom)
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                ExactDecimal::validate(Decimal::from(v)).map_err(E::custom)
+            }
             fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<Self::Value, E> {
                 Err(E::custom("monetary amounts and quantities must be sent as decimal strings, not floating point numbers"))
             }
@@ -142,8 +175,17 @@ mod tests {
 
     #[test]
     fn wire_format_always_has_exactly_four_decimals() {
-        for (input, expected) in [("0", "0.0000"), ("5200", "5200.0000"), ("4500.00000000", "4500.0000"), ("0.30", "0.3000"), ("-12.5", "-12.5000")] {
-            assert_eq!(Money::from_str_exact(input).unwrap().to_wire_string(), expected);
+        for (input, expected) in [
+            ("0", "0.0000"),
+            ("5200", "5200.0000"),
+            ("4500.00000000", "4500.0000"),
+            ("0.30", "0.3000"),
+            ("-12.5", "-12.5000"),
+        ] {
+            assert_eq!(
+                Money::from_str_exact(input).unwrap().to_wire_string(),
+                expected
+            );
         }
     }
 
@@ -151,7 +193,10 @@ mod tests {
     fn wire_rounding_is_half_away_from_zero_and_only_at_the_boundary() {
         let m = Money::from_str_exact("0.00005").unwrap();
         assert_eq!(m.to_wire_string(), "0.0001");
-        assert_eq!(Money::from_str_exact("-0.00005").unwrap().to_wire_string(), "-0.0001");
+        assert_eq!(
+            Money::from_str_exact("-0.00005").unwrap().to_wire_string(),
+            "-0.0001"
+        );
         // Internal value is untouched by serialization.
         assert_eq!(m.as_decimal(), "0.00005".parse::<Decimal>().unwrap());
     }
@@ -160,7 +205,10 @@ mod tests {
     fn serde_round_trip_is_exact_and_values_of_different_scale_serialize_identically() {
         let a = Money::from_str_exact("4500.00000000").unwrap();
         let b = Money::from_str_exact("4500.0000").unwrap();
-        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
         assert_eq!(serde_json::to_string(&a).unwrap(), "\"4500.0000\"");
         let back: Money = serde_json::from_str("\"4500.0000\"").unwrap();
         assert_eq!(back, b);
@@ -168,9 +216,20 @@ mod tests {
 
     #[test]
     fn exact_decimal_accepts_strings_and_integers_and_rejects_floats() {
-        assert_eq!(serde_json::from_str::<ExactDecimal>("\"450.25\"").unwrap().get(), "450.25".parse::<Decimal>().unwrap());
-        assert_eq!(serde_json::from_str::<ExactDecimal>("10").unwrap().get(), Decimal::from(10));
-        assert!(serde_json::from_str::<ExactDecimal>("450.25").is_err(), "JSON floats must be rejected");
+        assert_eq!(
+            serde_json::from_str::<ExactDecimal>("\"450.25\"")
+                .unwrap()
+                .get(),
+            "450.25".parse::<Decimal>().unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<ExactDecimal>("10").unwrap().get(),
+            Decimal::from(10)
+        );
+        assert!(
+            serde_json::from_str::<ExactDecimal>("450.25").is_err(),
+            "JSON floats must be rejected"
+        );
         assert!(serde_json::from_str::<ExactDecimal>("\"abc\"").is_err());
     }
 

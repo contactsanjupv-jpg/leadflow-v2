@@ -21,15 +21,74 @@ pub struct RunOutcome {
     pub weight_ticket_count: usize,
 }
 
-type InvoiceRow = (Uuid, Uuid, String, NaiveDate, NaiveDate, Option<Uuid>, Option<String>, Decimal, Option<Uuid>, Option<Uuid>);
-type LineRow = (Uuid, String, Option<String>, Decimal, String, Decimal, Decimal);
-type RateRow = (Uuid, Uuid, Option<Uuid>, String, String, Decimal, NaiveDate, Option<NaiveDate>);
-type ManifestRow = (Uuid, String, String, Option<i32>, Decimal, String, NaiveDate, Option<Uuid>);
-type TicketRow = (Uuid, Option<Uuid>, String, Decimal, String, Option<i32>, NaiveDate, Option<Uuid>);
-type PrevDiscrepancyRow = (String, String, String, String, String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<String>);
+type InvoiceRow = (
+    Uuid,
+    Uuid,
+    String,
+    NaiveDate,
+    NaiveDate,
+    Option<Uuid>,
+    Option<String>,
+    Decimal,
+    Option<Uuid>,
+    Option<Uuid>,
+);
+type LineRow = (
+    Uuid,
+    String,
+    Option<String>,
+    Decimal,
+    String,
+    Decimal,
+    Decimal,
+);
+type RateRow = (
+    Uuid,
+    Uuid,
+    Option<Uuid>,
+    String,
+    String,
+    Decimal,
+    NaiveDate,
+    Option<NaiveDate>,
+);
+type ManifestRow = (
+    Uuid,
+    String,
+    String,
+    Option<i32>,
+    Decimal,
+    String,
+    NaiveDate,
+    Option<Uuid>,
+);
+type TicketRow = (
+    Uuid,
+    Option<Uuid>,
+    String,
+    Decimal,
+    String,
+    Option<i32>,
+    NaiveDate,
+    Option<Uuid>,
+);
+type PrevDiscrepancyRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<Uuid>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+);
 
 /// Run (or re-run) the reconciliation for one invoice inside an already tenant-scoped transaction.
-pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id: Uuid, invoice_id: Uuid) -> Result<RunOutcome, AppError> {
+pub async fn run_for_invoice(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    invoice_id: Uuid,
+) -> Result<RunOutcome, AppError> {
     let inv: InvoiceRow = sqlx::query_as(
         "SELECT id, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total, source_document_id, manifest_id
          FROM invoices WHERE id = $1",
@@ -38,7 +97,18 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(AppError::NotFound)?;
-    let (_, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total, source_document_id, manifest_id) = inv;
+    let (
+        _,
+        vendor_id,
+        invoice_number,
+        invoice_date,
+        service_date,
+        facility_id,
+        waste_stream,
+        total,
+        source_document_id,
+        manifest_id,
+    ) = inv;
 
     let lines: Vec<LineRow> = sqlx::query_as(
         "SELECT id, description, fee_code, quantity, unit, unit_price, line_total FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
@@ -58,9 +128,19 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
         waste_stream: waste_stream.unwrap_or_default(),
         line_items: lines
             .into_iter()
-            .map(|(id, description, fee_code, quantity, unit, unit_price, line_total)| InvoiceLineItem {
-                id, description, fee_code, quantity, unit, unit_price: Money::from_decimal(unit_price), line_total: Money::from_decimal(line_total),
-            })
+            .map(
+                |(id, description, fee_code, quantity, unit, unit_price, line_total)| {
+                    InvoiceLineItem {
+                        id,
+                        description,
+                        fee_code,
+                        quantity,
+                        unit,
+                        unit_price: Money::from_decimal(unit_price),
+                        line_total: Money::from_decimal(line_total),
+                    }
+                },
+            )
             .collect(),
         total: Money::from_decimal(total),
         source_document_id,
@@ -97,18 +177,37 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
     .await?;
 
     let applicable_rate = match rate_row {
-        Some((id, vendor_id, facility_id, waste_stream, unit, unit_rate, effective_from, effective_to)) => {
+        Some((
+            id,
+            vendor_id,
+            facility_id,
+            waste_stream,
+            unit,
+            unit_rate,
+            effective_from,
+            effective_to,
+        )) => {
             let fees: Vec<(String, Option<String>, Decimal)> =
                 sqlx::query_as("SELECT fee_code, description, amount FROM contract_authorized_fees WHERE contract_rate_id = $1 ORDER BY fee_code")
                     .bind(id)
                     .fetch_all(&mut **tx)
                     .await?;
             Some(ContractRate {
-                id, vendor_id, waste_stream, facility_id, unit, effective_from, effective_to,
+                id,
+                vendor_id,
+                waste_stream,
+                facility_id,
+                unit,
+                effective_from,
+                effective_to,
                 unit_rate: Money::from_decimal(unit_rate),
                 authorized_fees: fees
                     .into_iter()
-                    .map(|(fee_code, description, amount)| AuthorizedFee { fee_code, description: description.unwrap_or_default(), amount: Money::from_decimal(amount) })
+                    .map(|(fee_code, description, amount)| AuthorizedFee {
+                        fee_code,
+                        description: description.unwrap_or_default(),
+                        amount: Money::from_decimal(amount),
+                    })
                     .collect(),
             })
         }
@@ -129,8 +228,28 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
         .bind(mid)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some((id, manifest_number, waste_stream, container_count, quantity, unit, shipment_date, source_document_id)) = m {
-            manifest = Some(Manifest { id, organization_id, manifest_number, waste_stream, container_count, quantity, unit, shipment_date, source_document_id });
+        if let Some((
+            id,
+            manifest_number,
+            waste_stream,
+            container_count,
+            quantity,
+            unit,
+            shipment_date,
+            source_document_id,
+        )) = m
+        {
+            manifest = Some(Manifest {
+                id,
+                organization_id,
+                manifest_number,
+                waste_stream,
+                container_count,
+                quantity,
+                unit,
+                shipment_date,
+                source_document_id,
+            });
         }
 
         let tickets: Vec<TicketRow> = sqlx::query_as(
@@ -148,17 +267,38 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
             let same: Vec<&TicketRow> = tickets.iter().filter(|t| t.4 == unit).collect();
             let skipped = tickets.len() - same.len();
             let net: Decimal = same.iter().map(|t| t.3).sum();
-            let containers: Option<i32> = if same.iter().any(|t| t.5.is_some()) { Some(same.iter().filter_map(|t| t.5).sum()) } else { None };
-            let numbers = same.iter().map(|t| t.2.as_str()).collect::<Vec<_>>().join("+");
+            let containers: Option<i32> = if same.iter().any(|t| t.5.is_some()) {
+                Some(same.iter().filter_map(|t| t.5).sum())
+            } else {
+                None
+            };
+            let numbers = same
+                .iter()
+                .map(|t| t.2.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
             first_ticket_id = Some(first.0);
             ticket_count = same.len();
-            extra_trace.push(format!("Weight support: {} ticket(s) [{}] aggregated to {} {}", same.len(), numbers, net, unit));
+            extra_trace.push(format!(
+                "Weight support: {} ticket(s) [{}] aggregated to {} {}",
+                same.len(),
+                numbers,
+                net,
+                unit
+            ));
             if skipped > 0 {
                 extra_trace.push(format!("{skipped} weight ticket(s) in a different unit than '{unit}' were not included (no unit conversion is applied)"));
             }
             weight_ticket = Some(WeightTicket {
-                id: first.0, organization_id, manifest_id: Some(mid), ticket_number: numbers, net_weight: net, unit,
-                container_count: containers, ticket_date: first.6, source_document_id: first.7,
+                id: first.0,
+                organization_id,
+                manifest_id: Some(mid),
+                ticket_number: numbers,
+                net_weight: net,
+                unit,
+                container_count: containers,
+                ticket_date: first.6,
+                source_document_id: first.7,
             });
         }
     }
@@ -175,16 +315,39 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
     .fetch_all(&mut **tx)
     .await?;
     let mut related_invoices: Vec<RelatedInvoice> = Vec::new();
-    for (rid, number, lid, description, fee_code, quantity, unit, unit_price, line_total) in related_rows {
+    for (rid, number, lid, description, fee_code, quantity, unit, unit_price, line_total) in
+        related_rows
+    {
         if related_invoices.last().map_or(true, |r| r.id != rid) {
-            related_invoices.push(RelatedInvoice { id: rid, invoice_number: number, line_items: Vec::new() });
+            related_invoices.push(RelatedInvoice {
+                id: rid,
+                invoice_number: number,
+                line_items: Vec::new(),
+            });
         }
-        related_invoices.last_mut().unwrap().line_items.push(InvoiceLineItem {
-            id: lid, description, fee_code, quantity, unit, unit_price: Money::from_decimal(unit_price), line_total: Money::from_decimal(line_total),
-        });
+        related_invoices
+            .last_mut()
+            .unwrap()
+            .line_items
+            .push(InvoiceLineItem {
+                id: lid,
+                description,
+                fee_code,
+                quantity,
+                unit,
+                unit_price: Money::from_decimal(unit_price),
+                line_total: Money::from_decimal(line_total),
+            });
     }
 
-    let input = ReconciliationInput { invoice, related_invoices, applicable_rate, manifest, weight_ticket, tolerances: Tolerances::default() };
+    let input = ReconciliationInput {
+        invoice,
+        related_invoices,
+        applicable_rate,
+        manifest,
+        weight_ticket,
+        tolerances: Tolerances::default(),
+    };
     let mut result = engine::run(&input);
     for line in extra_trace.into_iter().rev() {
         result.calculation_trace.insert(1, line);
@@ -223,7 +386,12 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
     let mut statuses = Vec::with_capacity(result.discrepancies.len());
     for d in &result.discrepancies {
         let amount_text = d.amount.to_wire_string();
-        let carried = previous.iter().find(|p| p.0 == d.discrepancy_type.as_db() && p.1 == d.rule_id && p.2 == d.description && p.3 == amount_text);
+        let carried = previous.iter().find(|p| {
+            p.0 == d.discrepancy_type.as_db()
+                && p.1 == d.rule_id
+                && p.2 == d.description
+                && p.3 == amount_text
+        });
         let (status, reviewed_by, reviewed_at, notes) = match carried {
             Some(p) => (p.4.clone(), p.5, p.6, p.7.clone()),
             None => ("NEW".to_string(), None, None, None),
@@ -262,13 +430,30 @@ pub async fn run_for_invoice(tx: &mut Transaction<'_, Postgres>, organization_id
         result.review_status = rolled;
     }
 
-    Ok(RunOutcome { reconciliation_id, result, discrepancy_ids, manifest_id: input.manifest.as_ref().map(|m| m.id), weight_ticket_count: ticket_count })
+    Ok(RunOutcome {
+        reconciliation_id,
+        result,
+        discrepancy_ids,
+        manifest_id: input.manifest.as_ref().map(|m| m.id),
+        weight_ticket_count: ticket_count,
+    })
 }
 
 /// Recompute a reconciliation's status from its discrepancies (after a review action).
-pub async fn refresh_reconciliation_status(tx: &mut Transaction<'_, Postgres>, reconciliation_id: Uuid) -> Result<ReviewStatus, AppError> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT review_status::text FROM discrepancies WHERE reconciliation_id = $1").bind(reconciliation_id).fetch_all(&mut **tx).await?;
-    let statuses: Vec<ReviewStatus> = rows.iter().filter_map(|r| ReviewStatus::from_db(&r.0)).collect();
+pub async fn refresh_reconciliation_status(
+    tx: &mut Transaction<'_, Postgres>,
+    reconciliation_id: Uuid,
+) -> Result<ReviewStatus, AppError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT review_status::text FROM discrepancies WHERE reconciliation_id = $1",
+    )
+    .bind(reconciliation_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let statuses: Vec<ReviewStatus> = rows
+        .iter()
+        .filter_map(|r| ReviewStatus::from_db(&r.0))
+        .collect();
     let rolled = ReviewStatus::rollup(&statuses);
     sqlx::query("UPDATE reconciliations SET review_status = $1::review_status, updated_at = now() WHERE id = $2")
         .bind(rolled.as_db())

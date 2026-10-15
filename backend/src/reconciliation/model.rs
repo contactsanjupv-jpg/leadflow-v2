@@ -147,11 +147,21 @@ pub struct DiscrepancyLine {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Confidence { High, Medium, Low }
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewStatus {
-    New, UnderReview, Confirmed, Rejected, NeedsInformation, Disputed, Resolved,
+    New,
+    UnderReview,
+    Confirmed,
+    Rejected,
+    NeedsInformation,
+    Disputed,
+    Resolved,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,12 +214,19 @@ impl ReviewStatus {
     /// Anything still unreviewed dominates; an empty set means nothing was found (RESOLVED).
     pub fn rollup(statuses: &[ReviewStatus]) -> ReviewStatus {
         let has = |s: ReviewStatus| statuses.contains(&s);
-        if has(ReviewStatus::New) { ReviewStatus::New }
-        else if has(ReviewStatus::UnderReview) { ReviewStatus::UnderReview }
-        else if has(ReviewStatus::NeedsInformation) { ReviewStatus::NeedsInformation }
-        else if has(ReviewStatus::Disputed) { ReviewStatus::Disputed }
-        else if has(ReviewStatus::Confirmed) { ReviewStatus::Confirmed }
-        else { ReviewStatus::Resolved }
+        if has(ReviewStatus::New) {
+            ReviewStatus::New
+        } else if has(ReviewStatus::UnderReview) {
+            ReviewStatus::UnderReview
+        } else if has(ReviewStatus::NeedsInformation) {
+            ReviewStatus::NeedsInformation
+        } else if has(ReviewStatus::Disputed) {
+            ReviewStatus::Disputed
+        } else if has(ReviewStatus::Confirmed) {
+            ReviewStatus::Confirmed
+        } else {
+            ReviewStatus::Resolved
+        }
     }
 }
 
@@ -248,7 +265,15 @@ mod db_mapping_tests {
 
     #[test]
     fn review_status_round_trips_through_db_labels() {
-        for s in [ReviewStatus::New, ReviewStatus::UnderReview, ReviewStatus::Confirmed, ReviewStatus::Rejected, ReviewStatus::NeedsInformation, ReviewStatus::Disputed, ReviewStatus::Resolved] {
+        for s in [
+            ReviewStatus::New,
+            ReviewStatus::UnderReview,
+            ReviewStatus::Confirmed,
+            ReviewStatus::Rejected,
+            ReviewStatus::NeedsInformation,
+            ReviewStatus::Disputed,
+            ReviewStatus::Resolved,
+        ] {
             assert_eq!(ReviewStatus::from_db(s.as_db()), Some(s));
         }
         assert_eq!(ReviewStatus::from_db("bogus"), None);
@@ -259,8 +284,14 @@ mod db_mapping_tests {
         use ReviewStatus::*;
         assert_eq!(ReviewStatus::rollup(&[]), Resolved);
         assert_eq!(ReviewStatus::rollup(&[Confirmed, New]), New);
-        assert_eq!(ReviewStatus::rollup(&[Confirmed, UnderReview, Rejected]), UnderReview);
-        assert_eq!(ReviewStatus::rollup(&[Confirmed, NeedsInformation]), NeedsInformation);
+        assert_eq!(
+            ReviewStatus::rollup(&[Confirmed, UnderReview, Rejected]),
+            UnderReview
+        );
+        assert_eq!(
+            ReviewStatus::rollup(&[Confirmed, NeedsInformation]),
+            NeedsInformation
+        );
         assert_eq!(ReviewStatus::rollup(&[Confirmed, Disputed]), Disputed);
         assert_eq!(ReviewStatus::rollup(&[Confirmed, Rejected]), Confirmed);
         assert_eq!(ReviewStatus::rollup(&[Rejected, Rejected]), Resolved);

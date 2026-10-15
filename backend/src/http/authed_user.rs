@@ -1,8 +1,8 @@
 //! Authentication + RBAC extractor (spec sections 8-9).
 
 use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
 use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -28,12 +28,20 @@ pub struct AuthedUser {
 
 impl AuthedUser {
     pub fn require_role(&self, allowed: &[Role]) -> Result<(), AppError> {
-        if allowed.contains(&self.role) { Ok(()) } else { Err(AppError::Authorization) }
+        if allowed.contains(&self.role) {
+            Ok(())
+        } else {
+            Err(AppError::Authorization)
+        }
     }
 
     /// Permission check used by every tenant-data handler (see `rbac`).
     pub fn require(&self, permission: crate::rbac::Permission) -> Result<(), AppError> {
-        if crate::rbac::role_can(&self.role, permission) { Ok(()) } else { Err(AppError::Authorization) }
+        if crate::rbac::role_can(&self.role, permission) {
+            Ok(())
+        } else {
+            Err(AppError::Authorization)
+        }
     }
 }
 
@@ -41,12 +49,27 @@ impl AuthedUser {
 impl FromRequestParts<AppState> for AuthedUser {
     type Rejection = AppError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let header = parts.headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(AppError::Authentication)?;
-        let token = header.strip_prefix("Bearer ").ok_or(AppError::Authentication)?;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let header = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(AppError::Authentication)?;
+        let token = header
+            .strip_prefix("Bearer ")
+            .ok_or(AppError::Authentication)?;
         let token_hash = auth::hash_token(token);
 
-        let row: (Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>, Uuid, Role) = sqlx::query_as(
+        let row: (
+            Uuid,
+            chrono::DateTime<Utc>,
+            Option<chrono::DateTime<Utc>>,
+            Uuid,
+            Role,
+        ) = sqlx::query_as(
             "SELECT s.user_id, s.expires_at, s.revoked_at, m.organization_id, m.role
              FROM sessions s
              JOIN memberships m ON m.user_id = s.user_id
@@ -65,6 +88,10 @@ impl FromRequestParts<AppState> for AuthedUser {
             return Err(AppError::Authentication);
         }
 
-        Ok(AuthedUser { user_id, organization_id, role })
+        Ok(AuthedUser {
+            user_id,
+            organization_id,
+            role,
+        })
     }
 }

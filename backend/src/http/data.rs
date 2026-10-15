@@ -251,13 +251,53 @@ pub async fn create_invoice(user: AuthedUser, State(state): State<AppState>, Jso
     if req.line_items.len() > 500 {
         return Err(AppError::Validation("too many line items (max 500)".into()));
     }
-    let mut lines = Vec::with_capacity(req.line_items.len());
+        let mut lines = Vec::with_capacity(req.line_items.len());
+    let mut sum_line_totals = Decimal::ZERO;
+    let rounding_tolerance = Decimal::new(1, 2); // $0.01
+
     for l in &req.line_items {
+        let description = clean_text("description", &l.description, 500)?;
+        let unit = clean_text("unit", &l.unit, 50)?;
+
         let fee_code = match &l.fee_code {
             Some(c) => Some(clean_text("fee_code", c, 50)?),
             None => None,
         };
-        lines.push((clean_text("description", &l.description, 500)?, fee_code, l.quantity.get(), clean_text("unit", &l.unit, 50)?, l.unit_price.get(), l.line_total.get()));
+
+        let quantity = l.quantity.get();
+        let unit_price = l.unit_price.get();
+        let line_total = l.line_total.get();
+        let calculated_total = quantity * unit_price;
+
+        if (line_total - calculated_total).abs() > rounding_tolerance {
+            return Err(AppError::Validation(format!(
+                "line '{}' has total {}, but quantity {} × unit price {} gives {}; difference exceeds the $0.01 rounding tolerance",
+                description,
+                line_total,
+                quantity,
+                unit_price,
+                calculated_total
+            )));
+        }
+
+        sum_line_totals += line_total;
+
+        lines.push((
+            description,
+            fee_code,
+            quantity,
+            unit,
+            unit_price,
+            line_total,
+        ));
+    }
+
+    if (req.total.get() - sum_line_totals).abs() > rounding_tolerance {
+        return Err(AppError::Validation(format!(
+            "invoice total {} does not match the sum of line totals {} within the $0.01 rounding tolerance",
+            req.total.get(),
+            sum_line_totals
+        )));
     }
 
     let mut tx = scoped_tx(&state, &user).await?;
