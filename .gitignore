@@ -1,0 +1,12 @@
+target/
+node_modules/
+.next/
+*.env
+.env
+!.env.example
+Cargo.lock.known-good.bak
+*.log
+
+# Keep local environment secrets out of Git
+.env*
+!.env.example

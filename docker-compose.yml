@@ -1,0 +1,59 @@
+# Single-host reference deployment. UNVERIFIED in the authoring sandbox (no Docker there).
+# Required env (see .env.example): POSTGRES_PASSWORD, XFLOW_APP_PASSWORD.
+# TLS termination/reverse proxy is NOT included: put Caddy/nginx/a cloud LB in front of `web`
+# (the session cookie is Secure in production and will not be sent over plain HTTP).
+name: xflow
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: xflow
+    volumes: ["pg_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d xflow"]
+      interval: 5s
+      retries: 10
+
+  migrate:
+    image: postgres:16
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres/xflow
+      XFLOW_APP_PASSWORD: ${XFLOW_APP_PASSWORD:?set XFLOW_APP_PASSWORD}
+    volumes: ["./migrations:/migrations:ro", "./scripts/migrate.sh:/migrate.sh:ro"]
+    # migrate.sh resolves ../migrations relative to itself, so mirror the repo layout.
+    entrypoint: ["sh", "-c", "mkdir -p /repo/scripts && cp /migrate.sh /repo/scripts/migrate.sh && ln -sfn /migrations /repo/migrations && sh /repo/scripts/migrate.sh"]
+    restart: "no"
+
+  backend:
+    build: { context: ., dockerfile: docker/Dockerfile.backend }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    environment:
+      DATABASE_URL: postgres://xflow_app:${XFLOW_APP_PASSWORD}@postgres/xflow
+      PADDLE_WEBHOOK_SECRET: ${PADDLE_WEBHOOK_SECRET:-}
+      BILLING_ENFORCEMENT: ${BILLING_ENFORCEMENT:-true}
+      WORKER_ENABLED: ${WORKER_ENABLED:-true}
+      PDF_EXTRACTION_ENABLED: ${PDF_EXTRACTION_ENABLED:-true}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes: ["uploads:/data/uploads"]
+    # Published so Paddle can reach /api/v1/billing/paddle/webhook; route ONLY that path (and nothing
+    # else) to the public internet at your proxy. Browsers talk to `web`, never directly to this service.
+    expose: ["8080"]
+
+  web:
+    build: { context: ., dockerfile: docker/Dockerfile.web }
+    depends_on: [backend]
+    environment:
+      API_INTERNAL_URL: http://backend:8080
+      # Public Paddle checkout settings (client-side token + price id); read at runtime, not build time.
+      PADDLE_CLIENT_TOKEN: ${PADDLE_CLIENT_TOKEN:-}
+      PADDLE_PRICE_ID: ${PADDLE_PRICE_ID:-}
+      PADDLE_ENV: ${PADDLE_ENV:-sandbox}
+    ports: ["3000:3000"]
+
+volumes:
+  pg_data:
+  uploads:

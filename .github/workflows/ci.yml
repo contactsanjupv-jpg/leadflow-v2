@@ -1,0 +1,85 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: xflow_test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@localhost/xflow_test
+      # Migration 0002 creates xflow_app with this placeholder password.
+      DATABASE_URL: postgres://xflow_app:CHANGE_ME_IN_PRODUCTION@localhost/xflow_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: backend }
+      - name: Install PDF tools (pdftotext for extraction tests, qpdf for PDF validation)
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils qpdf
+      - name: Apply migrations
+        run: sh scripts/migrate.sh
+      - name: Unit + integration tests (real Postgres, RLS active via xflow_app)
+        working-directory: backend
+        run: cargo test --locked
+      - name: Release build compiles
+        working-directory: backend
+        run: cargo build --release --locked
+
+  web:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: apps/web } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: apps/web/package-lock.json }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  e2e:
+    # Browser end-to-end test of the critical customer workflow against real servers (see scripts/e2e.sh).
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: xflow_e2e }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@localhost/xflow_e2e
+      DATABASE_URL: postgres://xflow_app:CHANGE_ME_IN_PRODUCTION@localhost/xflow_e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: backend }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: apps/web/package-lock.json }
+      - run: sh scripts/migrate.sh
+      - run: cargo build --locked
+        working-directory: backend
+      - run: npm ci && npm run build
+        working-directory: apps/web
+      - name: Browser e2e
+        run: BACKEND_BIN="$PWD/backend/target/debug/xflow-backend" sh scripts/e2e.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: e2e-artifacts, path: /tmp/e2e-artifacts }
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [backend, web, e2e]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f docker/Dockerfile.backend -t xflow-backend:ci .
+      - run: docker build -f docker/Dockerfile.web -t xflow-web:ci .

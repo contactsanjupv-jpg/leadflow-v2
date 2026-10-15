@@ -1,0 +1,2 @@
+# Operations
+Monitoring: scheduler enqueues one RECONCILE_PENDING job per org every `MONITOR_INTERVAL_SECS`; workers claim jobs via `claim_monitoring_job()` (safe with multiple replicas), failures retry with quadratic backoff up to `max_attempts`, stuck RUNNING jobs are reclaimed after 15 minutes. Inspect via `GET /monitoring/jobs` or the `monitoring_jobs` table. Back up Postgres and the uploads volume together.

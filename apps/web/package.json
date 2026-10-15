@@ -1,0 +1,26 @@
+{
+  "name": "xflow-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types lib/*.test.ts",
+    "test:e2e": "node --test --test-concurrency=1 --test-timeout=240000 e2e/*.test.mjs"
+  },
+  "dependencies": {
+    "next": "14.2.35",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@sparticuz/chromium": "131.0.1",
+    "@types/node": "20.14.10",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "playwright-core": "1.49.1",
+    "typescript": "5.5.4"
+  }
+}

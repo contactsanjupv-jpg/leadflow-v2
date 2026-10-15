@@ -1,0 +1,21 @@
+# Backend image. UNVERIFIED in the authoring sandbox (no Docker there); CI builds it on every push.
+# Rust 1.75 is the toolchain the pinned Cargo.lock was tested with. No database is needed to compile
+# (all queries are runtime-checked).
+FROM rust:1.75-bookworm AS build
+WORKDIR /app/backend
+COPY backend/Cargo.toml backend/Cargo.lock ./
+COPY backend/src ./src
+RUN cargo build --release --locked
+
+FROM debian:bookworm-slim
+# poppler-utils provides pdftotext, used to read the text layer of born-digital PDFs (no OCR).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 poppler-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin xflow \
+    && mkdir -p /data/uploads && chown xflow /data/uploads
+COPY --from=build /app/backend/target/release/xflow-backend /usr/local/bin/xflow-backend
+ENV BIND_ADDR=0.0.0.0:8080 STORAGE_DIR=/data/uploads
+USER xflow
+EXPOSE 8080
+VOLUME ["/data/uploads"]
+CMD ["xflow-backend"]
