@@ -59,6 +59,70 @@ async fn setup(
 }
 
 #[tokio::test]
+async fn invoice_creation_rejects_inconsistent_line_and_header_totals() {
+    let app = test_app().await;
+    let org = app.signup_org("invoice-totals").await;
+
+    let vendor = ok(
+        &app,
+        &org,
+        "/api/v1/vendors",
+        json!({ "name": "Invoice totals vendor" }),
+    )
+    .await;
+
+    let vendor_id = vendor["id"].as_str().unwrap().to_string();
+
+    let mut body = json!({
+        "vendor_id": vendor_id,
+        "invoice_number": "INV-BAD-LINE-TOTAL",
+        "invoice_date": "2026-03-15",
+        "service_date": "2026-03-10",
+        "waste_stream": "F003",
+        "total": "4500.00",
+        "line_items": [
+            {
+                "description": "Drum disposal",
+                "quantity": "10",
+                "unit": "drum",
+                "unit_price": "400.00",
+                "line_total": "3999.00"
+            },
+            {
+                "description": "Transportation",
+                "fee_code": "TRANSPORT",
+                "quantity": "1",
+                "unit": "flat",
+                "unit_price": "500.00",
+                "line_total": "500.00"
+            }
+        ]
+    });
+
+    // Quantity × unit price does not match the first line total.
+    let (status, response) = app.post("/api/v1/invoices", &org.token, body.clone()).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "inconsistent line total must be rejected: {response}"
+    );
+
+    // Fix the line total, but deliberately make the header total incorrect.
+    body["invoice_number"] = json!("INV-BAD-HEADER-TOTAL");
+    body["line_items"][0]["line_total"] = json!("4000.00");
+    body["total"] = json!("4600.00");
+
+    let (status, response) = app.post("/api/v1/invoices", &org.token, body).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "incorrect invoice header total must be rejected: {response}"
+    );
+}
+
+#[tokio::test]
 async fn manifest_and_tickets_feed_the_real_reconciliation_and_findings_are_persisted() {
     let app = test_app().await;
     let org = app.signup_org("flow").await;

@@ -61,7 +61,10 @@ test("critical customer workflow", async (t) => {
 
   const stepNames = [];
   const step = async (name, fn) => { stepNames.push(name); try { await fn(); } catch (e) { await page.screenshot({ path: `${ART}/FAIL-${stepNames.length}-${name.replace(/\W+/g, "_")}.png`, fullPage: true }); throw new Error(`step "${name}" failed: ${e.message}`); } };
-  const card = (title) => page.locator("section.card", { has: page.locator("h2", { hasText: title }) });
+  const card = (title) =>
+  page.locator("section.card", {
+    has: page.getByRole("heading", { name: title, exact: true }),
+  });
   const fillLabel = (scope, label, value) => scope.getByLabel(label, { exact: true }).fill(value);
 
   try {

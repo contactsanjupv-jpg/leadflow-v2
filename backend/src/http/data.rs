@@ -31,17 +31,41 @@ pub struct NewVendor {
     pub name: String,
 }
 
-pub async fn create_vendor(user: AuthedUser, State(state): State<AppState>, Json(req): Json<NewVendor>) -> Created {
+pub async fn create_vendor(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Json(req): Json<NewVendor>,
+) -> Created {
     user.require(Permission::ManageData)?;
     let name = clean_text("name", &req.name, 200)?;
     let mut tx = scoped_tx(&state, &user).await?;
-    let id: Uuid = sqlx::query_scalar("INSERT INTO vendors (organization_id, name) VALUES ($1, $2) RETURNING id").bind(user.organization_id).bind(&name).fetch_one(&mut *tx).await?;
-    audit::record(&mut tx, user.organization_id, Some(user.user_id), "vendor.create", "vendor", Some(id), None, Some(json!({ "name": name }))).await?;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO vendors (organization_id, name) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(user.organization_id)
+    .bind(&name)
+    .fetch_one(&mut *tx)
+    .await?;
+    audit::record(
+        &mut tx,
+        user.organization_id,
+        Some(user.user_id),
+        "vendor.create",
+        "vendor",
+        Some(id),
+        None,
+        Some(json!({ "name": name })),
+    )
+    .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id, "name": name }))))
 }
 
-pub async fn list_vendors(user: AuthedUser, State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, AppError> {
+pub async fn list_vendors(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Query(page): Query<Page>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     let v: Value = sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY t.name, t.id), '[]'::jsonb) FROM (SELECT id, name, created_at FROM vendors ORDER BY name, id LIMIT $1 OFFSET $2) t")
@@ -71,7 +95,11 @@ SELECT to_jsonb(c) || jsonb_build_object('rates', coalesce((
           FROM contract_rates cr WHERE cr.contract_id = c.id) r), '[]'::jsonb))
 FROM (SELECT id, vendor_id, name, source_document_id, created_at FROM contracts WHERE id = $1) c"#;
 
-pub async fn create_contract(user: AuthedUser, State(state): State<AppState>, Json(req): Json<NewContract>) -> Created {
+pub async fn create_contract(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Json(req): Json<NewContract>,
+) -> Created {
     user.require(Permission::ManageData)?;
     let name = clean_text("name", &req.name, 200)?;
     let mut tx = scoped_tx(&state, &user).await?;
@@ -81,14 +109,30 @@ pub async fn create_contract(user: AuthedUser, State(state): State<AppState>, Js
     }
     let id: Uuid = sqlx::query_scalar("INSERT INTO contracts (organization_id, vendor_id, name, source_document_id) VALUES ($1, $2, $3, $4) RETURNING id")
         .bind(user.organization_id).bind(req.vendor_id).bind(&name).bind(req.source_document_id).fetch_one(&mut *tx).await?;
-    if let Some(d) = req.source_document_id { crate::http::documents::mark_used(&mut tx, d, "a contract").await?; }
-    audit::record(&mut tx, user.organization_id, Some(user.user_id), "contract.create", "contract", Some(id), None, Some(json!({ "vendor_id": req.vendor_id, "name": name }))).await?;
+    if let Some(d) = req.source_document_id {
+        crate::http::documents::mark_used(&mut tx, d, "a contract").await?;
+    }
+    audit::record(
+        &mut tx,
+        user.organization_id,
+        Some(user.user_id),
+        "contract.create",
+        "contract",
+        Some(id),
+        None,
+        Some(json!({ "vendor_id": req.vendor_id, "name": name })),
+    )
+    .await?;
     let body = json_one(&mut tx, CONTRACT_DETAIL_SQL, id).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(body)))
 }
 
-pub async fn list_contracts(user: AuthedUser, State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, AppError> {
+pub async fn list_contracts(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Query(page): Query<Page>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     let v: Value = sqlx::query_scalar(
@@ -102,7 +146,11 @@ pub async fn list_contracts(user: AuthedUser, State(state): State<AppState>, Que
     Ok(Json(v))
 }
 
-pub async fn get_contract(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>, AppError> {
+pub async fn get_contract(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     Ok(Json(json_one(&mut tx, CONTRACT_DETAIL_SQL, id).await?))
@@ -129,29 +177,52 @@ pub struct NewRate {
     pub authorized_fees: Vec<NewFee>,
 }
 
-pub async fn create_rate(user: AuthedUser, State(state): State<AppState>, Path(contract_id): Path<Uuid>, Json(req): Json<NewRate>) -> Created {
+pub async fn create_rate(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(contract_id): Path<Uuid>,
+    Json(req): Json<NewRate>,
+) -> Created {
     user.require(Permission::ManageData)?;
     let waste_stream = clean_text("waste_stream", &req.waste_stream, 100)?;
     let unit = clean_text("unit", &req.unit, 50)?;
     if req.unit_rate.get() < Decimal::ZERO {
-        return Err(AppError::Validation("unit_rate must not be negative".into()));
+        return Err(AppError::Validation(
+            "unit_rate must not be negative".into(),
+        ));
     }
     check_date("effective_from", req.effective_from)?;
-    if let Some(to) = req.effective_to { check_date("effective_to", to)?; }
+    if let Some(to) = req.effective_to {
+        check_date("effective_to", to)?;
+    }
     if req.effective_to.map_or(false, |to| to < req.effective_from) {
-        return Err(AppError::Validation("effective_to must not be before effective_from".into()));
+        return Err(AppError::Validation(
+            "effective_to must not be before effective_from".into(),
+        ));
     }
     let mut fees = Vec::with_capacity(req.authorized_fees.len());
     for f in &req.authorized_fees {
         if f.amount.get() < Decimal::ZERO {
-            return Err(AppError::Validation("authorized fee amounts must not be negative".into()));
+            return Err(AppError::Validation(
+                "authorized fee amounts must not be negative".into(),
+            ));
         }
-        fees.push((clean_text("fee_code", &f.fee_code, 50)?, f.description.as_deref().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()), f.amount.get()));
+        fees.push((
+            clean_text("fee_code", &f.fee_code, 50)?,
+            f.description
+                .as_deref()
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty()),
+            f.amount.get(),
+        ));
     }
 
     let mut tx = scoped_tx(&state, &user).await?;
     ensure_owned(&mut tx, "contracts", contract_id).await?;
-    let vendor_id: Uuid = sqlx::query_scalar("SELECT vendor_id FROM contracts WHERE id = $1").bind(contract_id).fetch_one(&mut *tx).await?;
+    let vendor_id: Uuid = sqlx::query_scalar("SELECT vendor_id FROM contracts WHERE id = $1")
+        .bind(contract_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let rate_id: Uuid = sqlx::query_scalar(
         "INSERT INTO contract_rates (organization_id, contract_id, vendor_id, facility_id, waste_stream, unit, unit_rate, effective_from, effective_to)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
@@ -181,19 +252,39 @@ pub struct EndRate {
 
 /// Rates are otherwise immutable: a price change is a new rate with its own effective window,
 /// which keeps the history the reconciliation engine relies on. Only the end date can change.
-pub async fn end_rate(user: AuthedUser, State(state): State<AppState>, Path(rate_id): Path<Uuid>, Json(req): Json<EndRate>) -> Result<Json<Value>, AppError> {
+pub async fn end_rate(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(rate_id): Path<Uuid>,
+    Json(req): Json<EndRate>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ManageData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     check_date("effective_to", req.effective_to)?;
     let row: Option<(NaiveDate, Option<NaiveDate>, Uuid)> = sqlx::query_as("SELECT effective_from, effective_to, contract_id FROM contract_rates WHERE id = $1 FOR UPDATE").bind(rate_id).fetch_optional(&mut *tx).await?;
     let (from, old_to, contract_id) = row.ok_or(AppError::NotFound)?;
     if req.effective_to < from {
-        return Err(AppError::Validation("effective_to must not be before effective_from".into()));
+        return Err(AppError::Validation(
+            "effective_to must not be before effective_from".into(),
+        ));
     }
-    sqlx::query("UPDATE contract_rates SET effective_to = $2 WHERE id = $1").bind(rate_id).bind(req.effective_to).execute(&mut *tx).await
+    sqlx::query("UPDATE contract_rates SET effective_to = $2 WHERE id = $1")
+        .bind(rate_id)
+        .bind(req.effective_to)
+        .execute(&mut *tx)
+        .await
         .map_err(|e| conflict_on_constraint(e, "the new end date overlaps another rate"))?;
-    audit::record(&mut tx, user.organization_id, Some(user.user_id), "contract_rate.set_end_date", "contract_rate", Some(rate_id),
-        Some(json!({ "effective_to": old_to })), Some(json!({ "effective_to": req.effective_to }))).await?;
+    audit::record(
+        &mut tx,
+        user.organization_id,
+        Some(user.user_id),
+        "contract_rate.set_end_date",
+        "contract_rate",
+        Some(rate_id),
+        Some(json!({ "effective_to": old_to })),
+        Some(json!({ "effective_to": req.effective_to })),
+    )
+    .await?;
     let body = json_one(&mut tx, CONTRACT_DETAIL_SQL, contract_id).await?;
     tx.commit().await?;
     Ok(Json(body))
@@ -239,19 +330,25 @@ SELECT to_jsonb(i) || jsonb_build_object(
 FROM (SELECT id, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total::text AS total,
              source_document_id, manifest_id, created_at, updated_at FROM invoices WHERE id = $1) i"#;
 
-pub async fn create_invoice(user: AuthedUser, State(state): State<AppState>, Json(req): Json<NewInvoice>) -> Created {
+pub async fn create_invoice(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Json(req): Json<NewInvoice>,
+) -> Created {
     user.require(Permission::ManageData)?;
     let invoice_number = clean_text("invoice_number", &req.invoice_number, 100)?;
     let waste_stream = clean_text("waste_stream", &req.waste_stream, 100)?;
     check_date("invoice_date", req.invoice_date)?;
     check_date("service_date", req.service_date)?;
     if req.line_items.is_empty() {
-        return Err(AppError::Validation("an invoice needs at least one line item".into()));
+        return Err(AppError::Validation(
+            "an invoice needs at least one line item".into(),
+        ));
     }
     if req.line_items.len() > 500 {
         return Err(AppError::Validation("too many line items (max 500)".into()));
     }
-        let mut lines = Vec::with_capacity(req.line_items.len());
+    let mut lines = Vec::with_capacity(req.line_items.len());
     let mut sum_line_totals = Decimal::ZERO;
     let rounding_tolerance = Decimal::new(1, 2); // $0.01
 
@@ -302,8 +399,12 @@ pub async fn create_invoice(user: AuthedUser, State(state): State<AppState>, Jso
 
     let mut tx = scoped_tx(&state, &user).await?;
     ensure_owned(&mut tx, "vendors", req.vendor_id).await?;
-    if let Some(m) = req.manifest_id { ensure_owned(&mut tx, "manifests", m).await?; }
-    if let Some(d) = req.source_document_id { ensure_owned(&mut tx, "documents", d).await?; }
+    if let Some(m) = req.manifest_id {
+        ensure_owned(&mut tx, "manifests", m).await?;
+    }
+    if let Some(d) = req.source_document_id {
+        ensure_owned(&mut tx, "documents", d).await?;
+    }
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO invoices (organization_id, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total, source_document_id, manifest_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
@@ -318,7 +419,9 @@ pub async fn create_invoice(user: AuthedUser, State(state): State<AppState>, Jso
             .bind(id).bind(user.organization_id).bind(description).bind(fee_code).bind(quantity).bind(unit).bind(unit_price).bind(line_total)
             .execute(&mut *tx).await?;
     }
-    if let Some(d) = req.source_document_id { crate::http::documents::mark_used(&mut tx, d, "an invoice").await?; }
+    if let Some(d) = req.source_document_id {
+        crate::http::documents::mark_used(&mut tx, d, "an invoice").await?;
+    }
     audit::record(&mut tx, user.organization_id, Some(user.user_id), "invoice.create", "invoice", Some(id), None,
         Some(json!({ "vendor_id": req.vendor_id, "invoice_number": invoice_number, "total": req.total.get().to_string(), "line_count": lines.len(), "manifest_id": req.manifest_id }))).await?;
     let body = json_one(&mut tx, INVOICE_DETAIL_SQL, id).await?;
@@ -326,7 +429,11 @@ pub async fn create_invoice(user: AuthedUser, State(state): State<AppState>, Jso
     Ok((StatusCode::CREATED, Json(body)))
 }
 
-pub async fn list_invoices(user: AuthedUser, State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, AppError> {
+pub async fn list_invoices(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Query(page): Query<Page>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     let v: Value = sqlx::query_scalar(
@@ -344,7 +451,11 @@ pub async fn list_invoices(user: AuthedUser, State(state): State<AppState>, Quer
     Ok(Json(v))
 }
 
-pub async fn get_invoice(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>, AppError> {
+pub async fn get_invoice(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     Ok(Json(json_one(&mut tx, INVOICE_DETAIL_SQL, id).await?))
@@ -356,14 +467,39 @@ pub struct LinkManifest {
     pub manifest_id: Option<Uuid>,
 }
 
-pub async fn link_invoice_manifest(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>, Json(req): Json<LinkManifest>) -> Result<Json<Value>, AppError> {
+pub async fn link_invoice_manifest(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<LinkManifest>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ManageData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     ensure_owned(&mut tx, "invoices", id).await?;
-    if let Some(m) = req.manifest_id { ensure_owned(&mut tx, "manifests", m).await?; }
-    let old: Option<Uuid> = sqlx::query_scalar("SELECT manifest_id FROM invoices WHERE id = $1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await?;
-    sqlx::query("UPDATE invoices SET manifest_id = $2, updated_at = now() WHERE id = $1").bind(id).bind(req.manifest_id).execute(&mut *tx).await?;
-    audit::record(&mut tx, user.organization_id, Some(user.user_id), "invoice.link_manifest", "invoice", Some(id), Some(json!({ "manifest_id": old })), Some(json!({ "manifest_id": req.manifest_id }))).await?;
+    if let Some(m) = req.manifest_id {
+        ensure_owned(&mut tx, "manifests", m).await?;
+    }
+    let old: Option<Uuid> =
+        sqlx::query_scalar("SELECT manifest_id FROM invoices WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    sqlx::query("UPDATE invoices SET manifest_id = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(req.manifest_id)
+        .execute(&mut *tx)
+        .await?;
+    audit::record(
+        &mut tx,
+        user.organization_id,
+        Some(user.user_id),
+        "invoice.link_manifest",
+        "invoice",
+        Some(id),
+        Some(json!({ "manifest_id": old })),
+        Some(json!({ "manifest_id": req.manifest_id })),
+    )
+    .await?;
     let body = json_one(&mut tx, INVOICE_DETAIL_SQL, id).await?;
     tx.commit().await?;
     Ok(Json(body))
@@ -391,20 +527,30 @@ SELECT to_jsonb(m) || jsonb_build_object(
       SELECT id, invoice_number, invoice_date, total::text AS total FROM invoices WHERE manifest_id = m.id) i))
 FROM (SELECT id, manifest_number, waste_stream, container_count, quantity::text AS quantity, unit, shipment_date, source_document_id, created_at FROM manifests WHERE id = $1) m"#;
 
-pub async fn create_manifest(user: AuthedUser, State(state): State<AppState>, Json(req): Json<NewManifest>) -> Created {
+pub async fn create_manifest(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Json(req): Json<NewManifest>,
+) -> Created {
     user.require(Permission::ManageData)?;
     let manifest_number = clean_text("manifest_number", &req.manifest_number, 100)?;
     let waste_stream = clean_text("waste_stream", &req.waste_stream, 100)?;
     let unit = clean_text("unit", &req.unit, 50)?;
     check_date("shipment_date", req.shipment_date)?;
     if req.quantity.get() <= Decimal::ZERO {
-        return Err(AppError::Validation("quantity must be greater than zero".into()));
+        return Err(AppError::Validation(
+            "quantity must be greater than zero".into(),
+        ));
     }
     if req.container_count.map_or(false, |c| c < 0) {
-        return Err(AppError::Validation("container_count must not be negative".into()));
+        return Err(AppError::Validation(
+            "container_count must not be negative".into(),
+        ));
     }
     let mut tx = scoped_tx(&state, &user).await?;
-    if let Some(d) = req.source_document_id { ensure_owned(&mut tx, "documents", d).await?; }
+    if let Some(d) = req.source_document_id {
+        ensure_owned(&mut tx, "documents", d).await?;
+    }
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO manifests (organization_id, manifest_number, waste_stream, container_count, quantity, unit, shipment_date, source_document_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
@@ -413,7 +559,9 @@ pub async fn create_manifest(user: AuthedUser, State(state): State<AppState>, Js
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| conflict_on_constraint(e, "a manifest with that number already exists"))?;
-    if let Some(d) = req.source_document_id { crate::http::documents::mark_used(&mut tx, d, "a manifest").await?; }
+    if let Some(d) = req.source_document_id {
+        crate::http::documents::mark_used(&mut tx, d, "a manifest").await?;
+    }
     audit::record(&mut tx, user.organization_id, Some(user.user_id), "manifest.create", "manifest", Some(id), None,
         Some(json!({ "manifest_number": manifest_number, "waste_stream": waste_stream, "quantity": req.quantity.get().to_string(), "unit": unit }))).await?;
     let body = json_one(&mut tx, MANIFEST_DETAIL_SQL, id).await?;
@@ -421,7 +569,11 @@ pub async fn create_manifest(user: AuthedUser, State(state): State<AppState>, Js
     Ok((StatusCode::CREATED, Json(body)))
 }
 
-pub async fn list_manifests(user: AuthedUser, State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, AppError> {
+pub async fn list_manifests(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Query(page): Query<Page>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     let v: Value = sqlx::query_scalar(
@@ -435,7 +587,11 @@ pub async fn list_manifests(user: AuthedUser, State(state): State<AppState>, Que
     Ok(Json(v))
 }
 
-pub async fn get_manifest(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>, AppError> {
+pub async fn get_manifest(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     Ok(Json(json_one(&mut tx, MANIFEST_DETAIL_SQL, id).await?))
@@ -457,20 +613,32 @@ pub struct NewWeightTicket {
 
 const WEIGHT_DETAIL_SQL: &str = "SELECT to_jsonb(w) FROM (SELECT id, ticket_number, manifest_id, net_weight::text AS net_weight, unit, container_count, ticket_date, source_document_id, created_at FROM weight_records WHERE id = $1) w";
 
-pub async fn create_weight_ticket(user: AuthedUser, State(state): State<AppState>, Json(req): Json<NewWeightTicket>) -> Created {
+pub async fn create_weight_ticket(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Json(req): Json<NewWeightTicket>,
+) -> Created {
     user.require(Permission::ManageData)?;
     let ticket_number = clean_text("ticket_number", &req.ticket_number, 100)?;
     let unit = clean_text("unit", &req.unit, 50)?;
     check_date("ticket_date", req.ticket_date)?;
     if req.net_weight.get() <= Decimal::ZERO {
-        return Err(AppError::Validation("net_weight must be greater than zero".into()));
+        return Err(AppError::Validation(
+            "net_weight must be greater than zero".into(),
+        ));
     }
     if req.container_count.map_or(false, |c| c < 0) {
-        return Err(AppError::Validation("container_count must not be negative".into()));
+        return Err(AppError::Validation(
+            "container_count must not be negative".into(),
+        ));
     }
     let mut tx = scoped_tx(&state, &user).await?;
-    if let Some(m) = req.manifest_id { ensure_owned(&mut tx, "manifests", m).await?; }
-    if let Some(d) = req.source_document_id { ensure_owned(&mut tx, "documents", d).await?; }
+    if let Some(m) = req.manifest_id {
+        ensure_owned(&mut tx, "manifests", m).await?;
+    }
+    if let Some(d) = req.source_document_id {
+        ensure_owned(&mut tx, "documents", d).await?;
+    }
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO weight_records (organization_id, manifest_id, ticket_number, net_weight, unit, container_count, ticket_date, source_document_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
@@ -479,7 +647,9 @@ pub async fn create_weight_ticket(user: AuthedUser, State(state): State<AppState
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| conflict_on_constraint(e, "a weight ticket with that number already exists"))?;
-    if let Some(d) = req.source_document_id { crate::http::documents::mark_used(&mut tx, d, "a weight ticket").await?; }
+    if let Some(d) = req.source_document_id {
+        crate::http::documents::mark_used(&mut tx, d, "a weight ticket").await?;
+    }
     audit::record(&mut tx, user.organization_id, Some(user.user_id), "weight_ticket.create", "weight_ticket", Some(id), None,
         Some(json!({ "ticket_number": ticket_number, "manifest_id": req.manifest_id, "net_weight": req.net_weight.get().to_string(), "unit": unit }))).await?;
     let body = json_one(&mut tx, WEIGHT_DETAIL_SQL, id).await?;
@@ -487,7 +657,11 @@ pub async fn create_weight_ticket(user: AuthedUser, State(state): State<AppState
     Ok((StatusCode::CREATED, Json(body)))
 }
 
-pub async fn list_weight_tickets(user: AuthedUser, State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, AppError> {
+pub async fn list_weight_tickets(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Query(page): Query<Page>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     let v: Value = sqlx::query_scalar(
@@ -501,7 +675,11 @@ pub async fn list_weight_tickets(user: AuthedUser, State(state): State<AppState>
     Ok(Json(v))
 }
 
-pub async fn get_weight_ticket(user: AuthedUser, State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>, AppError> {
+pub async fn get_weight_ticket(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     Ok(Json(json_one(&mut tx, WEIGHT_DETAIL_SQL, id).await?))
