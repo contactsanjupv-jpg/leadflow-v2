@@ -10,3 +10,7 @@ Cargo.lock.known-good.bak
 # Keep local environment secrets out of Git
 .env*
 !.env.example
+
+# Runtime uploads (user-supplied documents) must never be committed.
+backend/data/uploads/
+/data/uploads/
