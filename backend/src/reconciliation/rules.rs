@@ -1,6 +1,7 @@
 //! Deterministic reconciliation rules (spec section 18).
 
 use crate::common::money::Money;
+use crate::common::waste_stream;
 use crate::reconciliation::model::*;
 use rust_decimal::Decimal;
 
@@ -376,9 +377,11 @@ pub fn check_waste_stream_mismatch(
     invoice: &Invoice,
     manifest: &Manifest,
 ) -> Option<DiscrepancyLine> {
-    if invoice.waste_stream.trim().is_empty()
-        || manifest.waste_stream.trim().is_empty()
-        || same_text(&invoice.waste_stream, &manifest.waste_stream)
+    // Same canonical key as rate lookup (case and whitespace folded). A blank stream on either
+    // side is unknown, not a mismatch.
+    if waste_stream::key(&invoice.waste_stream).is_none()
+        || waste_stream::key(&manifest.waste_stream).is_none()
+        || waste_stream::same(&invoice.waste_stream, &manifest.waste_stream)
     {
         return None;
     }
@@ -872,5 +875,12 @@ mod tests {
             check_waste_stream_mismatch(&inv, &m("F005")).is_none(),
             "an unknown stream is not a mismatch"
         );
+        // Whitespace runs collapse to one space exactly like rate lookup; distinct identifiers still mismatch.
+        inv.waste_stream = "F  003".into();
+        assert!(check_waste_stream_mismatch(&inv, &m("f 003")).is_none());
+        inv.waste_stream = "F003".into();
+        assert!(check_waste_stream_mismatch(&inv, &m("F0030")).is_some());
+        // Internal whitespace is collapsed, NOT removed: "F 003" is a different identifier from "F003".
+        assert!(check_waste_stream_mismatch(&inv, &m("F 003")).is_some());
     }
 }

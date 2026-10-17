@@ -46,7 +46,7 @@ pub async fn invoices_needing_reconciliation(
            LEFT JOIN LATERAL (SELECT created_at FROM reconciliations r WHERE r.invoice_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1) lr ON true
            WHERE lr.created_at IS NULL
               OR i.updated_at > lr.created_at
-              OR EXISTS (SELECT 1 FROM contract_rates cr WHERE cr.vendor_id = i.vendor_id AND cr.waste_stream = i.waste_stream AND cr.created_at > lr.created_at)
+              OR EXISTS (SELECT 1 FROM contract_rates cr WHERE cr.vendor_id = i.vendor_id AND cr.waste_stream_key = i.waste_stream_key AND cr.created_at > lr.created_at)
               OR EXISTS (SELECT 1 FROM manifests m WHERE m.id = i.manifest_id AND m.created_at > lr.created_at)
               OR EXISTS (SELECT 1 FROM weight_records w WHERE w.manifest_id = i.manifest_id AND w.created_at > lr.created_at)
            ORDER BY i.created_at LIMIT $1"#,

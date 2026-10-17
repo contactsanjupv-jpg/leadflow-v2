@@ -83,6 +83,38 @@ type PrevDiscrepancyRow = (
     Option<String>,
 );
 
+/// Load a rate's authorized fees and build the domain `ContractRate`.
+async fn load_rate(
+    tx: &mut Transaction<'_, Postgres>,
+    row: RateRow,
+) -> Result<ContractRate, AppError> {
+    let (id, vendor_id, facility_id, waste_stream, unit, unit_rate, effective_from, effective_to) =
+        row;
+    let fees: Vec<(String, Option<String>, Decimal)> =
+        sqlx::query_as("SELECT fee_code, description, amount FROM contract_authorized_fees WHERE contract_rate_id = $1 ORDER BY fee_code")
+            .bind(id)
+            .fetch_all(&mut **tx)
+            .await?;
+    Ok(ContractRate {
+        id,
+        vendor_id,
+        waste_stream,
+        facility_id,
+        unit,
+        effective_from,
+        effective_to,
+        unit_rate: Money::from_decimal(unit_rate),
+        authorized_fees: fees
+            .into_iter()
+            .map(|(fee_code, description, amount)| AuthorizedFee {
+                fee_code,
+                description: description.unwrap_or_default(),
+                amount: Money::from_decimal(amount),
+            })
+            .collect(),
+    })
+}
+
 /// Run (or re-run) the reconciliation for one invoice inside an already tenant-scoped transaction.
 pub async fn run_for_invoice(
     tx: &mut Transaction<'_, Postgres>,
@@ -146,73 +178,76 @@ pub async fn run_for_invoice(
         source_document_id,
     };
 
-    let rate_row: Option<RateRow> = sqlx::query_as(
-        r#"
-        SELECT id, vendor_id, facility_id, waste_stream, unit,
-               unit_rate, effective_from, effective_to
-        FROM contract_rates
-        WHERE vendor_id = $1
-          AND waste_stream = $2
-          AND effective_from <= $3
-          AND (facility_id IS NULL OR facility_id = $4)
-        ORDER BY
-          CASE
-            WHEN effective_to IS NULL OR effective_to >= $3 THEN 0
-            ELSE 1
-          END ASC,
-          CASE
-            WHEN $4 IS NOT NULL AND facility_id = $4 THEN 0
-            WHEN facility_id IS NULL THEN 1
-            ELSE 2
-          END ASC,
-          effective_from DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(invoice.vendor_id)
-    .bind(&invoice.waste_stream)
-    .bind(invoice.service_date)
-    .bind(invoice.facility_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    // Rate lookup. Streams are compared by the canonical key (case/whitespace folded; the text
+    // as entered is preserved). A rate is APPLICABLE only if its window covers the service date;
+    // facility-specific beats vendor-wide; another facility's rate is never a fallback. A blank
+    // invoice stream has no key and matches nothing.
+    let stream_key = crate::common::waste_stream::key(&invoice.waste_stream);
 
-    let applicable_rate = match rate_row {
-        Some((
-            id,
-            vendor_id,
-            facility_id,
-            waste_stream,
-            unit,
-            unit_rate,
-            effective_from,
-            effective_to,
-        )) => {
-            let fees: Vec<(String, Option<String>, Decimal)> =
-                sqlx::query_as("SELECT fee_code, description, amount FROM contract_authorized_fees WHERE contract_rate_id = $1 ORDER BY fee_code")
-                    .bind(id)
-                    .fetch_all(&mut **tx)
-                    .await?;
-            Some(ContractRate {
-                id,
-                vendor_id,
-                waste_stream,
-                facility_id,
-                unit,
-                effective_from,
-                effective_to,
-                unit_rate: Money::from_decimal(unit_rate),
-                authorized_fees: fees
-                    .into_iter()
-                    .map(|(fee_code, description, amount)| AuthorizedFee {
-                        fee_code,
-                        description: description.unwrap_or_default(),
-                        amount: Money::from_decimal(amount),
-                    })
-                    .collect(),
-            })
+    let mut applicable_rate: Option<ContractRate> = None;
+    let mut stale_rate: Option<ContractRate> = None;
+    if let Some(key) = stream_key.as_deref() {
+        let covering: Option<RateRow> = sqlx::query_as(
+            r#"
+            SELECT id, vendor_id, facility_id, waste_stream, unit,
+                   unit_rate, effective_from, effective_to
+            FROM contract_rates
+            WHERE vendor_id = $1
+              AND waste_stream_key = $2
+              AND effective_from <= $3
+              AND (effective_to IS NULL OR effective_to >= $3)
+              AND (facility_id IS NULL OR facility_id = $4)
+            ORDER BY
+              CASE
+                WHEN $4 IS NOT NULL AND facility_id = $4 THEN 0
+                ELSE 1
+              END ASC,
+              effective_from DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(invoice.vendor_id)
+        .bind(key)
+        .bind(invoice.service_date)
+        .bind(invoice.facility_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        match covering {
+            Some(row) => applicable_rate = Some(load_rate(tx, row).await?),
+            None => {
+                // Nothing covers the service date. If an EXPIRED rate exists for the same scope,
+                // keep it for reporting only (it must never price the invoice).
+                let expired: Option<RateRow> = sqlx::query_as(
+                    r#"
+                    SELECT id, vendor_id, facility_id, waste_stream, unit,
+                           unit_rate, effective_from, effective_to
+                    FROM contract_rates
+                    WHERE vendor_id = $1
+                      AND waste_stream_key = $2
+                      AND effective_from <= $3
+                      AND effective_to IS NOT NULL AND effective_to < $3
+                      AND (facility_id IS NULL OR facility_id = $4)
+                    ORDER BY
+                      CASE
+                        WHEN $4 IS NOT NULL AND facility_id = $4 THEN 0
+                        ELSE 1
+                      END ASC,
+                      effective_to DESC
+                    LIMIT 1
+                    "#,
+                )
+                .bind(invoice.vendor_id)
+                .bind(key)
+                .bind(invoice.service_date)
+                .bind(invoice.facility_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+                if let Some(row) = expired {
+                    stale_rate = Some(load_rate(tx, row).await?);
+                }
+            }
         }
-        None => None,
-    };
+    }
 
     // Supporting documents come from the invoice's explicit manifest link.
     let mut manifest: Option<Manifest> = None;
@@ -344,6 +379,7 @@ pub async fn run_for_invoice(
         invoice,
         related_invoices,
         applicable_rate,
+        stale_rate,
         manifest,
         weight_ticket,
         tolerances: Tolerances::default(),

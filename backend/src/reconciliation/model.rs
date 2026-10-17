@@ -98,7 +98,13 @@ pub struct ReconciliationInput {
     /// duplicate-charge rule. Empty when there are none.
     #[serde(default)]
     pub related_invoices: Vec<RelatedInvoice>,
+    /// The rate whose effective window covers the service date (facility-specific preferred).
     pub applicable_rate: Option<ContractRate>,
+    /// When no rate covers the service date but an EXPIRED rate exists for the same vendor,
+    /// waste stream and facility scope, it is carried here for reporting only. It is never used
+    /// to price the invoice.
+    #[serde(default)]
+    pub stale_rate: Option<ContractRate>,
     pub manifest: Option<Manifest>,
     pub weight_ticket: Option<WeightTicket>,
     pub tolerances: Tolerances,

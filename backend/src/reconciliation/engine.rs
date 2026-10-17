@@ -13,7 +13,16 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         input.invoice.invoice_number, input.invoice.service_date
     ));
 
-    let expected_amount = match &input.applicable_rate {
+    // Only a rate whose window covers the service date may price the invoice. An expired rate
+    // (whether supplied as `stale_rate` or mistakenly as `applicable_rate`) is reported, never used.
+    let service_date = input.invoice.service_date;
+    let (usable_rate, expired_rate) = match &input.applicable_rate {
+        Some(r) if r.covers_date(service_date) => (Some(r), input.stale_rate.as_ref()),
+        Some(r) => (None, Some(r)),
+        None => (None, input.stale_rate.as_ref()),
+    };
+
+    let expected_amount = match usable_rate {
         Some(rate) => {
             trace.push(format!(
                 "Matched contract rate {}/{} effective {} - {}",
@@ -24,11 +33,6 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
                     .map(|d| d.to_string())
                     .unwrap_or_else(|| "open".into())
             ));
-
-            if let Some(stale) = rules::check_stale_rate(&input.invoice, rate) {
-                trace.push(format!("RULE {}: {}", stale.rule_id, stale.description));
-                discrepancies.push(stale);
-            }
 
             let fee_and_rate_discrepancies = rules::check_rate_and_fees(&input.invoice, rate);
             for d in &fee_and_rate_discrepancies {
@@ -105,14 +109,34 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
             expected
         }
         None => {
-            trace.push("No applicable contract rate found for this service date - expected amount cannot be computed.".into());
-            discrepancies.push(DiscrepancyLine {
-                discrepancy_type: DiscrepancyType::MissingSupport,
-                description: "No contracted rate found covering this invoice's service date".into(),
-                amount: Money::zero(),
-                rule_id: "RULE_00_NO_RATE".to_string(),
-                confidence: Confidence::High,
-            });
+            // No usable rate: the expected amount cannot be computed. It is shown equal to the
+            // invoiced amount ONLY because the stored amount is non-null; no dollar discrepancy is
+            // asserted and the finding below forces human review.
+            let finding = match expired_rate
+                .and_then(|r| rules::check_stale_rate(&input.invoice, r))
+            {
+                Some(stale) => {
+                    trace.push(format!(
+                        "Contract rate for this stream expired before the service date and was not used for pricing: expected amount cannot be computed."
+                    ));
+                    stale
+                }
+                None => {
+                    // Detail lives in the trace, NOT in the finding description: carry-forward of review
+                    // decisions matches on the description, which must stay the baseline text.
+                    trace.push("No contracted rate found covering this invoice's waste stream, facility and service date; the expected amount cannot be computed (shown equal to the invoiced amount, so no dollar discrepancy is asserted) - manual review required.".into());
+                    DiscrepancyLine {
+                        discrepancy_type: DiscrepancyType::MissingSupport,
+                        description:
+                            "No contracted rate found covering this invoice's service date".into(),
+                        amount: Money::zero(),
+                        rule_id: "RULE_00_NO_RATE".to_string(),
+                        confidence: Confidence::High,
+                    }
+                }
+            };
+            trace.push(format!("RULE {}: {}", finding.rule_id, finding.description));
+            discrepancies.push(finding);
             input.invoice.total
         }
     };
@@ -185,11 +209,7 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         discrepancies.push(d);
     }
 
-    for d in rules::check_duplicate_charges(
-        &input.invoice,
-        input.applicable_rate.as_ref(),
-        &input.related_invoices,
-    ) {
+    for d in rules::check_duplicate_charges(&input.invoice, usable_rate, &input.related_invoices) {
         trace.push(format!(
             "RULE {}: {} (amount: {})",
             d.rule_id, d.description, d.amount
@@ -299,6 +319,7 @@ mod tests {
             invoice,
             related_invoices: vec![],
             applicable_rate: Some(rate),
+            stale_rate: None,
             manifest: None,
             weight_ticket: None,
             tolerances: Tolerances::default(),
@@ -527,5 +548,79 @@ mod tests {
             .discrepancies
             .iter()
             .any(|d| d.rule_id == "RULE_08_WASTE_STREAM_MISMATCH"));
+    }
+
+    // ---- Level 1: missing / expired rate handling ----
+    #[test]
+    fn expired_rate_is_reported_but_never_prices_the_invoice() {
+        let mut input = build_input();
+        let mut expired = input.applicable_rate.take().unwrap();
+        expired.effective_to = Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+        input.stale_rate = Some(expired);
+        let r = run(&input);
+        assert!(r
+            .discrepancies
+            .iter()
+            .any(|d| d.rule_id == rules::RULE_STALE_RATE));
+        assert!(!r
+            .discrepancies
+            .iter()
+            .any(|d| d.rule_id == "RULE_00_NO_RATE"));
+        assert!(
+            !r.discrepancies
+                .iter()
+                .any(|d| d.rule_id == rules::RULE_RATE_MISMATCH
+                    || d.rule_id == rules::RULE_UNAUTHORIZED_FEE),
+            "expired rate must not generate priced findings"
+        );
+        assert_eq!(r.discrepancy_amount, Money::zero());
+        assert_eq!(
+            r.review_status,
+            ReviewStatus::New,
+            "must require human review"
+        );
+        assert!(r
+            .calculation_trace
+            .iter()
+            .any(|l| l.contains("expired") && l.contains("not used")));
+    }
+
+    #[test]
+    fn expired_rate_passed_as_applicable_is_still_not_used_for_pricing() {
+        let mut input = build_input();
+        input.applicable_rate.as_mut().unwrap().effective_to =
+            Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+        let r = run(&input);
+        assert!(r
+            .discrepancies
+            .iter()
+            .any(|d| d.rule_id == rules::RULE_STALE_RATE));
+        assert!(!r
+            .discrepancies
+            .iter()
+            .any(|d| d.rule_id == rules::RULE_RATE_MISMATCH));
+        assert_eq!(r.discrepancy_amount, Money::zero());
+    }
+
+    #[test]
+    fn missing_rate_states_that_the_expected_amount_is_not_computable() {
+        let mut input = build_input();
+        input.applicable_rate = None;
+        let r = run(&input);
+        let d = r
+            .discrepancies
+            .iter()
+            .find(|d| d.rule_id == "RULE_00_NO_RATE")
+            .unwrap();
+        // Exact baseline description (review carry-forward matches on it); detail is in the trace.
+        assert_eq!(
+            d.description,
+            "No contracted rate found covering this invoice's service date"
+        );
+        assert!(r
+            .calculation_trace
+            .iter()
+            .any(|l| l.contains("cannot be computed") && l.contains("manual review")));
+        assert_eq!(r.review_status, ReviewStatus::New);
     }
 }
