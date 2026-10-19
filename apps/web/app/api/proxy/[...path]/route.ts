@@ -4,9 +4,11 @@ import { backendUrl, sameOrigin, SESSION_COOKIE } from "@/lib/server";
 
 // Authenticated pass-through to the Rust API. Only /api/v1/* is reachable, the session token is
 // injected from the httpOnly cookie, and state-changing calls must be same-origin (CSRF).
-async function forward(req: Request, { params }: { params: { path: string[] } }) {
+// Next 15: route params are a Promise.
+async function forward(req: Request, ctx: { params: Promise<{ path: string[] }> }) {
+  const params = await ctx.params;
   if (!sameOrigin(req)) return NextResponse.json({ error: { code: "FORBIDDEN", message: "cross-origin request blocked" } }, { status: 403 });
-  const token = cookies().get(SESSION_COOKIE)?.value;
+  const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) return NextResponse.json({ error: { code: "AUTHENTICATION_ERROR", message: "authentication required" } }, { status: 401 });
   if (params.path.some((p) => p === ".." || p === "." || p.includes("\\"))) return NextResponse.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
   if (params.path[0] === "billing" && params.path[1] === "paddle") return NextResponse.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });

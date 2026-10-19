@@ -8,7 +8,7 @@ import { SESSION_EXPIRED_PATH } from "@/lib/session-redirect";
 export const dynamic = "force-dynamic";
 
 export default async function AppLayout({ children }: { children: ReactNode }) {
-  const token = cookies().get(SESSION_COOKIE)?.value;
+  const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) redirect("/login");
   const res = await fetch(`${backendUrl()}/api/v1/me`, { headers: { authorization: `Bearer ${token}` }, cache: "no-store" }).catch(() => null);
   // Not plain "/login": the cookie is still present, and the middleware would bounce us back to "/".

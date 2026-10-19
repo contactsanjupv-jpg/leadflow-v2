@@ -230,6 +230,9 @@ test("critical customer workflow", async (t) => {
 
     await step("open a dispute and take it through verified credit recovery", async () => {
       await page.getByRole("button", { name: "Open dispute" }).click();
+      // Wait for the app's own confirmation before navigating: the dispute is created by an async POST, and
+      // navigating immediately aborts it on a slow runner, so the /disputes row below never appears (CI flake).
+      await page.getByText("Dispute opened").waitFor();
       await page.goto(`${WEB}/disputes`);
       await page.locator("tbody tr", { hasText: "Acme Disposal" }).first().click();
       for (const to of ["PREPARE", "REVIEW", "SUBMITTED", "VENDOR RESPONDED"]) await page.getByRole("button", { name: `→ ${to}` }).click().then(() => page.waitForTimeout(150));

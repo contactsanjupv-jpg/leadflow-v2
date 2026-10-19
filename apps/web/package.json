@@ -11,7 +11,7 @@
     "test:e2e": "node --test --test-concurrency=1 --test-timeout=240000 e2e/*.test.mjs"
   },
   "dependencies": {
-    "next": "14.2.35",
+    "next": "15.5.28",
     "react": "18.3.1",
     "react-dom": "18.3.1"
   },
@@ -23,5 +23,8 @@
     "playwright-core": "1.49.1",
     "tsx": "^4.23.15",
     "typescript": "5.5.4"
+  },
+  "overrides": {
+    "postcss": "8.5.28"
   }
 }
