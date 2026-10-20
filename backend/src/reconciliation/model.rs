@@ -94,17 +94,22 @@ pub struct RelatedInvoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationInput {
     pub invoice: Invoice,
-    /// Earlier-entered invoices from the same vendor for the same service date, used only by the
-    /// duplicate-charge rule. Empty when there are none.
+
+    /// Earlier-entered invoices from the same vendor for the same service date,
+    /// used only by the duplicate-charge rule.
     #[serde(default)]
     pub related_invoices: Vec<RelatedInvoice>,
-    /// The rate whose effective window covers the service date (facility-specific preferred).
-    pub applicable_rate: Option<ContractRate>,
-    /// When no rate covers the service date but an EXPIRED rate exists for the same vendor,
-    /// waste stream and facility scope, it is carried here for reporting only. It is never used
-    /// to price the invoice.
+
+    /// All rates whose effective window covers the service date for this vendor + waste stream
+    /// and whose facility scope is compatible (facility-specific preferred over vendor-wide).
+    /// The engine matches each primary line to the rate whose unit matches the line.
     #[serde(default)]
-    pub stale_rate: Option<ContractRate>,
+    pub applicable_rates: Vec<ContractRate>,
+    /// Expired rates for the same vendor/stream/facility scope, for diagnostics only (RULE_06).
+    /// Never used to price any line.
+    #[serde(default)]
+    pub stale_rates: Vec<ContractRate>,
+
     pub manifest: Option<Manifest>,
     pub weight_ticket: Option<WeightTicket>,
     pub tolerances: Tolerances,
@@ -195,6 +200,12 @@ impl PricingStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricedInvoiceLine {
+    pub invoice_line_item_id: Uuid,
+    pub contract_rate_id: Uuid,
+    pub expected_line_amount: Money,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationResult {
     pub invoice_id: Uuid,
     pub pricing_status: PricingStatus,
@@ -209,6 +220,8 @@ pub struct ReconciliationResult {
     /// Sum of dollar amounts attached to findings. This is not a complete bill-level discrepancy when pricing is incomplete.
     pub identified_finding_amount: Money,
     pub discrepancies: Vec<DiscrepancyLine>,
+    /// One entry per successfully priced primary (non-fee) invoice line.
+    pub priced_lines: Vec<PricedInvoiceLine>,
     pub tolerances_applied: Tolerances,
     pub review_status: ReviewStatus,
     pub calculation_trace: Vec<String>,

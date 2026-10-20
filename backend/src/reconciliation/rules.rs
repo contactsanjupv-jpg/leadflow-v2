@@ -94,6 +94,153 @@ pub fn check_rate_and_fees(invoice: &Invoice, rate: &ContractRate) -> Vec<Discre
     out
 }
 
+/// Check primary invoice lines against their own unit-matched rates.
+/// Existing single-rate callers continue to use `check_rate_and_fees`.
+pub fn check_rate_and_fees_multi(
+    invoice: &Invoice,
+    rates: &[&ContractRate],
+) -> Vec<DiscrepancyLine> {
+    let mut out = Vec::new();
+
+    for line in &invoice.line_items {
+        if let Some(fee_code) = &line.fee_code {
+            let amounts: Vec<Money> = rates
+                .iter()
+                .flat_map(|rate| rate.authorized_fees.iter())
+                .filter(|fee| &fee.fee_code == fee_code)
+                .map(|fee| fee.amount)
+                .collect();
+
+            let distinct: Vec<Money> =
+                amounts.into_iter().fold(Vec::new(), |mut acc, amount| {
+                    if !acc.contains(&amount) {
+                        acc.push(amount);
+                    }
+                    acc
+                });
+
+            match distinct.as_slice() {
+                [] => out.push(DiscrepancyLine {
+                    discrepancy_type: DiscrepancyType::UnauthorizedFee,
+                    description: format!(
+                        "Fee '{}' ({}) billed but not found in contracted authorized fees",
+                        fee_code, line.description
+                    ),
+                    amount: line.line_total,
+                    rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
+                    confidence: Confidence::High,
+                }),
+                [authorized] if *authorized != line.line_total => {
+                    out.push(DiscrepancyLine {
+                        discrepancy_type: DiscrepancyType::UnauthorizedFee,
+                        description: format!(
+                            "Fee '{}' billed at {} but authorized amount is {}",
+                            fee_code, line.line_total, authorized
+                        ),
+                        amount: line.line_total - *authorized,
+                        rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
+                        confidence: Confidence::High,
+                    });
+                }
+                [_] => {}
+                _ => out.push(DiscrepancyLine {
+                    discrepancy_type: DiscrepancyType::Other,
+                    description: format!(
+                        "Fee '{}' has conflicting authorized amounts across applicable contract rates; manual review is required",
+                        fee_code
+                    ),
+                    amount: Money::zero(),
+                    rule_id: "RULE_11_AMBIGUOUS_RATE".to_string(),
+                    confidence: Confidence::High,
+                }),
+            }
+
+            continue;
+        }
+
+        let matching: Vec<&ContractRate> = rates
+            .iter()
+            .copied()
+            .filter(|rate| same_text(&line.unit, &rate.unit))
+            .collect();
+
+        // Missing or ambiguous rates are reported by the engine; do not invent
+        // a price or duplicate those findings here.
+        let [rate] = matching.as_slice() else {
+            continue;
+        };
+
+        if line.unit_price != rate.unit_rate {
+            let expected_line_total = rate.unit_rate * line.quantity;
+
+            out.push(DiscrepancyLine {
+                discrepancy_type: DiscrepancyType::RateMismatch,
+                description: format!(
+                    "Invoiced at {}/{} but contracted rate is {}/{} (qty {})",
+                    line.unit_price,
+                    line.unit,
+                    rate.unit_rate,
+                    rate.unit,
+                    line.quantity
+                ),
+                amount: line.line_total - expected_line_total,
+                rule_id: RULE_RATE_MISMATCH.to_string(),
+                confidence: Confidence::High,
+            });
+        }
+    }
+
+    out
+}
+
+pub fn select_rate_for_line<'a>(
+    invoice: &Invoice,
+    line: &InvoiceLineItem,
+    rates: &'a [ContractRate],
+) -> Option<&'a ContractRate> {
+    let stream_key = waste_stream::key(&invoice.waste_stream)?;
+
+    let mut candidates: Vec<&ContractRate> = rates
+        .iter()
+        .filter(|rate| {
+            rate.vendor_id == invoice.vendor_id
+                && rate.covers_date(invoice.service_date)
+                && waste_stream::key(&rate.waste_stream).as_deref()
+                    == Some(stream_key.as_str())
+                && (rate.facility_id.is_none()
+                    || rate.facility_id == invoice.facility_id)
+                && same_text(&rate.unit, &line.unit)
+        })
+        .collect();
+
+    candidates.sort_by_key(|rate| {
+        (
+            if rate.facility_id == invoice.facility_id
+                && invoice.facility_id.is_some()
+            {
+                0
+            } else {
+                1
+            },
+            std::cmp::Reverse(rate.effective_from),
+        )
+    });
+
+    let best = *candidates.first()?;
+
+    // Never silently choose between equally specific, equally recent rates.
+    let ambiguous = candidates.iter().skip(1).any(|candidate| {
+        candidate.facility_id == best.facility_id
+            && candidate.effective_from == best.effective_from
+    });
+
+    if ambiguous {
+        None
+    } else {
+        Some(best)
+    }
+}
+
 pub fn check_quantity_vs_manifest(
     invoice: &Invoice,
     manifest: &Manifest,
@@ -368,6 +515,95 @@ pub fn check_duplicate_charges(
             }
         })
         .collect()
+}
+
+/// Multi-rate version of RULE_05. Existing single-rate callers remain supported.
+pub fn check_duplicate_charges_multi(
+    invoice: &Invoice,
+    rates: &[&ContractRate],
+    related: &[RelatedInvoice],
+) -> Vec<DiscrepancyLine> {
+    find_duplicates(invoice, related)
+        .into_iter()
+        .map(|(i, other)| {
+            let line = &invoice.line_items[i];
+
+            let (description, confidence) = match other {
+                None => (
+                    format!(
+                        "Line '{}' ({} x {} = {}) is billed more than once on this invoice",
+                        line.description.trim(),
+                        line.quantity,
+                        line.unit_price,
+                        line.line_total
+                    ),
+                    Confidence::Medium,
+                ),
+                Some(num) => (
+                    format!(
+                        "Line '{}' ({}) was already billed on invoice {} for the same service date",
+                        line.description.trim(),
+                        line.line_total,
+                        num
+                    ),
+                    Confidence::High,
+                ),
+            };
+
+            DiscrepancyLine {
+                discrepancy_type: DiscrepancyType::DuplicateCharge,
+                description,
+                amount: line.line_total - already_attributed_multi(line, rates),
+                rule_id: RULE_DUPLICATE_CHARGE.to_string(),
+                confidence,
+            }
+        })
+        .collect()
+}
+
+fn already_attributed_multi(
+    line: &InvoiceLineItem,
+    rates: &[&ContractRate],
+) -> Money {
+    if line.fee_code.is_none() {
+        let matching: Vec<&ContractRate> = rates
+            .iter()
+            .copied()
+            .filter(|rate| same_text(&line.unit, &rate.unit))
+            .collect();
+
+        if let [rate] = matching.as_slice() {
+            if line.unit_price != rate.unit_rate {
+                return line.line_total - rate.unit_rate * line.quantity;
+            }
+        }
+
+        return Money::zero();
+    }
+
+    let Some(code) = line.fee_code.as_deref() else {
+        return Money::zero();
+    };
+
+    let amounts: Vec<Money> = rates
+        .iter()
+        .flat_map(|rate| rate.authorized_fees.iter())
+        .filter(|fee| fee.fee_code == code)
+        .map(|fee| fee.amount)
+        .collect();
+
+    let distinct: Vec<Money> = amounts.into_iter().fold(Vec::new(), |mut acc, amount| {
+        if !acc.contains(&amount) {
+            acc.push(amount);
+        }
+        acc
+    });
+
+    match distinct.as_slice() {
+        [] => line.line_total,
+        [authorized] => line.line_total - *authorized,
+        _ => Money::zero(),
+    }
 }
 
 /// RULE_08 waste stream mismatch: the invoice bills a different waste stream than the manifest

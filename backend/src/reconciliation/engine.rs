@@ -13,140 +13,265 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         input.invoice.invoice_number, input.invoice.service_date
     ));
 
-    // Only a rate whose window covers the service date may price the invoice. An expired rate
-    // (whether supplied as `stale_rate` or mistakenly as `applicable_rate`) is reported, never used.
     let service_date = input.invoice.service_date;
-    let (usable_rate, expired_rate) = match &input.applicable_rate {
-        Some(r) if r.covers_date(service_date) => (Some(r), input.stale_rate.as_ref()),
-        Some(r) => (None, Some(r)),
-        None => (None, input.stale_rate.as_ref()),
-    };
 
-    let (pricing_status, expected_amount, partial_expected_amount) = match usable_rate {
-        Some(rate) => {
-            trace.push(format!(
-                "Matched contract rate {}/{} effective {} - {}",
-                rate.unit_rate,
-                rate.unit,
-                rate.effective_from,
-                rate.effective_to
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| "open".into())
-            ));
+    // Only rates that actually cover the service date may price lines.
+    // Rates that actually cover the service date may price lines.
+    let applicable_rates: Vec<&ContractRate> = input
+        .applicable_rates
+        .iter()
+        .filter(|r| r.covers_date(service_date))
+        .collect();
 
-            let fee_and_rate_discrepancies = rules::check_rate_and_fees(&input.invoice, rate);
-            for d in &fee_and_rate_discrepancies {
-                trace.push(format!(
-                    "RULE {}: {} (amount: {})",
-                    d.rule_id, d.description, d.amount
-                ));
-            }
-            discrepancies.extend(fee_and_rate_discrepancies);
+    // Anything supplied that does NOT cover the date is treated as stale for reporting only.
+    // This preserves the old behaviour when an expired rate was passed in the applicable slot.
+    let mut stale_rates: Vec<&ContractRate> = input
+        .stale_rates
+        .iter()
+        .filter(|r| !r.covers_date(service_date))
+        .collect();
+    for r in &input.applicable_rates {
+        if !r.covers_date(service_date) {
+            stale_rates.push(r);
+        }
+    }
 
-            // Duplicate lines (RULE_05) are not "expected": they are reported in full as findings.
-            let dups = rules::duplicate_line_indices(&input.invoice, &input.related_invoices);
-            let counted = |i: usize| !dups.contains(&i);
-            let primary_qty: rust_decimal::Decimal = input
-                .invoice
-                .line_items
-                .iter()
-                .enumerate()
-                .filter(|(i, line)| {
-                    counted(*i)
-                        && line.fee_code.is_none()
-                        && line.unit.trim().eq_ignore_ascii_case(rate.unit.trim())
-                })
-                .map(|(_, line)| line.quantity)
-                .sum();
+    // Duplicate lines are excluded from expected pricing (RULE_05).
+    let dups = rules::duplicate_line_indices(&input.invoice, &input.related_invoices);
+    let counted = |i: usize| !dups.contains(&i);
 
-            let incompatible_primary_count = input
-                .invoice
-                .line_items
-                .iter()
-                .enumerate()
-                .filter(|(i, line)| {
-                    counted(*i)
-                        && line.fee_code.is_none()
-                        && !line.unit.trim().eq_ignore_ascii_case(rate.unit.trim())
-                })
-                .count();
+    let mut priced_lines: Vec<PricedInvoiceLine> = Vec::new();
+    let mut expected = Money::zero();
+    let mut unpriced_primary = 0usize;
+    let mut unpriced_fee = 0usize;
 
-            if incompatible_primary_count > 0 {
-                trace.push(format!(
-                    "Excluded {} primary invoice line(s) from rate-based pricing because their units do not match the contracted unit '{}'; no unit conversion is configured",
-                    incompatible_primary_count, rate.unit
-                ));
+    // ---- Primary (non-fee) lines + fees ----
+    // Only run when at least one rate actually covers the service date.
+    // An expired rate (even if it was supplied in applicable_rates) must never
+    // produce rate-mismatch or unauthorized-fee findings.
+    if !applicable_rates.is_empty() {
+        for (idx, line) in input.invoice.line_items.iter().enumerate() {
+            if !counted(idx) || line.fee_code.is_some() {
+                continue;
             }
 
-            let mut expected = rate.unit_rate * primary_qty;
-            trace.push(format!(
-                "Expected primary line subtotal: {} {} x {} / {} = {}",
-                primary_qty, rate.unit, rate.unit_rate, rate.unit, expected
-            ));
-
-            for line in input
-                .invoice
-                .line_items
+            let matches: Vec<&ContractRate> = applicable_rates
                 .iter()
-                .enumerate()
-                .filter(|(i, l)| counted(*i) && l.fee_code.is_some())
-                .map(|(_, l)| l)
-            {
-                if let Some(fee_code) = &line.fee_code {
-                    if let Some(auth) = rate
-                        .authorized_fees
-                        .iter()
-                        .find(|f| &f.fee_code == fee_code)
-                    {
-                        expected = expected + auth.amount;
+                .copied()
+                .filter(|r| r.unit.trim().eq_ignore_ascii_case(line.unit.trim()))
+                .collect();
+
+            match matches.as_slice() {
+                [rate] => {
+                    let expected_line = rate.unit_rate * line.quantity;
+                    expected = expected + expected_line;
+                    priced_lines.push(PricedInvoiceLine {
+                        invoice_line_item_id: line.id,
+                        contract_rate_id: rate.id,
+                        expected_line_amount: expected_line,
+                    });
+                    trace.push(format!(
+                        "Priced line '{}' ({} {}): {} x {} = {} using rate {}",
+                        line.description.trim(),
+                        line.quantity,
+                        line.unit,
+                        line.quantity,
+                        rate.unit_rate,
+                        expected_line,
+                        rate.id
+                    ));
+
+                    if line.unit_price != rate.unit_rate {
+                        let diff = line.line_total - expected_line;
+                        let d = DiscrepancyLine {
+                            discrepancy_type: DiscrepancyType::RateMismatch,
+                            description: format!(
+                                "Invoiced at {}/{} but contracted rate is {}/{} (qty {})",
+                                line.unit_price, line.unit, rate.unit_rate, rate.unit, line.quantity
+                            ),
+                            amount: diff,
+                            rule_id: rules::RULE_RATE_MISMATCH.to_string(),
+                            confidence: Confidence::High,
+                        };
                         trace.push(format!(
-                            "Expected authorized fee '{}': {}",
-                            fee_code, auth.amount
+                            "RULE {}: {} (amount: {})",
+                            d.rule_id, d.description, d.amount
                         ));
+                        discrepancies.push(d);
                     }
+                }
+                [] => {
+                    unpriced_primary += 1;
+                    trace.push(format!(
+                        "Primary line '{}' unit '{}' has no matching applicable rate; no unit conversion is configured",
+                        line.description.trim(),
+                        line.unit
+                    ));
+                    discrepancies.push(DiscrepancyLine {
+                        discrepancy_type: DiscrepancyType::Other,
+                        description: format!(
+                            "Invoice line '{}' uses unit '{}' but no applicable contract rate was found for that unit; no unit conversion is configured",
+                            line.description, line.unit
+                        ),
+                        amount: Money::zero(),
+                        rule_id: rules::RULE_UNIT_MISMATCH.to_string(),
+                        confidence: Confidence::Medium,
+                    });
+                }
+                _ => {
+                    unpriced_primary += 1;
+                    trace.push(format!(
+                        "Primary line '{}' unit '{}' matches {} applicable rates; refusing to choose",
+                        line.description.trim(),
+                        line.unit,
+                        matches.len()
+                    ));
+                    discrepancies.push(DiscrepancyLine {
+                        discrepancy_type: DiscrepancyType::Other,
+                        description: format!(
+                            "Invoice line '{}' unit '{}' has multiple applicable contract rates; pricing is ambiguous",
+                            line.description, line.unit
+                        ),
+                        amount: Money::zero(),
+                        rule_id: "RULE_11_AMBIGUOUS_RATE".to_string(),
+                        confidence: Confidence::High,
+                    });
+                }
+            }
+        }
+
+        // Fees
+        for (idx, line) in input.invoice.line_items.iter().enumerate() {
+            if !counted(idx) {
+                continue;
+            }
+            let Some(fee_code) = &line.fee_code else { continue };
+
+            let auth_amounts: Vec<Money> = applicable_rates
+                .iter()
+                .flat_map(|r| r.authorized_fees.iter())
+                .filter(|f| f.fee_code.trim().eq_ignore_ascii_case(fee_code.trim()))
+                .map(|f| f.amount)
+                .collect();
+
+            let mut distinct = Vec::new();
+            for a in &auth_amounts {
+                if !distinct.contains(a) {
+                    distinct.push(*a);
                 }
             }
 
-            if incompatible_primary_count > 0 {
-                trace.push(format!(
-                    "Pricing is PARTIAL: {} is a diagnostic subtotal only, not the full invoice expected amount; the full expected amount and bill-level discrepancy cannot be computed until the unit mismatch is resolved.",
-                    expected
-                ));
-                (PricingStatus::Partial, None, Some(expected))
-            } else {
-                (PricingStatus::Complete, Some(expected), None)
+            match distinct.as_slice() {
+                [amount] => {
+                    expected = expected + *amount;
+                    if let Some(rate) = applicable_rates.iter().find(|r| {
+                        r.authorized_fees.iter().any(|f| {
+                            f.fee_code.trim().eq_ignore_ascii_case(fee_code.trim())
+                                && f.amount == *amount
+                        })
+                    }) {
+                        priced_lines.push(PricedInvoiceLine {
+                            invoice_line_item_id: line.id,
+                            contract_rate_id: rate.id,
+                            expected_line_amount: *amount,
+                        });
+                    }
+                    trace.push(format!(
+                        "Expected authorized fee '{}': {}",
+                        fee_code, amount
+                    ));
+                    if *amount != line.line_total {
+                        let diff = line.line_total - *amount;
+                        let d = DiscrepancyLine {
+                            discrepancy_type: DiscrepancyType::UnauthorizedFee,
+                            description: format!(
+                                "Fee '{}' billed at {} but authorized amount is {}",
+                                fee_code, line.line_total, amount
+                            ),
+                            amount: diff,
+                            rule_id: rules::RULE_UNAUTHORIZED_FEE.to_string(),
+                            confidence: Confidence::High,
+                        };
+                        trace.push(format!(
+                            "RULE {}: {} (amount: {})",
+                            d.rule_id, d.description, d.amount
+                        ));
+                        discrepancies.push(d);
+                    }
+                }
+                [] => {
+                    let d = DiscrepancyLine {
+                        discrepancy_type: DiscrepancyType::UnauthorizedFee,
+                        description: format!(
+                            "Fee '{}' ({}) billed but not found in contracted authorized fees",
+                            fee_code, line.description
+                        ),
+                        amount: line.line_total,
+                        rule_id: rules::RULE_UNAUTHORIZED_FEE.to_string(),
+                        confidence: Confidence::High,
+                    };
+                    trace.push(format!(
+                        "RULE {}: {} (amount: {})",
+                        d.rule_id, d.description, d.amount
+                    ));
+                    discrepancies.push(d);
+                }
+                _ => {
+                    unpriced_fee += 1;
+                    trace.push(format!(
+                        "Fee '{}' has conflicting authorized amounts across applicable rates",
+                        fee_code
+                    ));
+                    discrepancies.push(DiscrepancyLine {
+                        discrepancy_type: DiscrepancyType::Other,
+                        description: format!(
+                            "Fee '{}' is authorized at conflicting amounts by multiple rates; expected amount is ambiguous",
+                            fee_code
+                        ),
+                        amount: Money::zero(),
+                        rule_id: "RULE_11_AMBIGUOUS_FEE".to_string(),
+                        confidence: Confidence::High,
+                    });
+                }
             }
         }
-        None => {
-            // An absent or expired rate never produces an expected amount or bill-level discrepancy.
-            let finding = match expired_rate
-                .and_then(|r| rules::check_stale_rate(&input.invoice, r))
-            {
-                Some(stale) => {
+    }
+
+    // ---- Pricing status ----
+    let (pricing_status, expected_amount, partial_expected_amount) =
+        if applicable_rates.is_empty() {
+            // No covering rate at all.
+            if let Some(stale) = stale_rates.first() {
+                if let Some(finding) = rules::check_stale_rate(&input.invoice, stale) {
                     trace.push(
                         "Contract rate for this stream expired before the service date and was not used for pricing; expected amount and bill-level discrepancy cannot be computed.".into(),
                     );
-                    stale
+                    trace.push(format!("RULE {}: {}", finding.rule_id, finding.description));
+                    discrepancies.push(finding);
                 }
-                None => {
-                    // Keep this description stable: review-decision carry-forward matches on it.
-                    trace.push("No contracted rate found covering this invoice's waste stream, facility and service date; expected amount and bill-level discrepancy cannot be computed - manual review required.".into());
-                    DiscrepancyLine {
-                        discrepancy_type: DiscrepancyType::MissingSupport,
-                        description:
-                            "No contracted rate found covering this invoice's service date".into(),
-                        amount: Money::zero(),
-                        rule_id: "RULE_00_NO_RATE".to_string(),
-                        confidence: Confidence::High,
-                    }
-                }
-            };
-            trace.push(format!("RULE {}: {}", finding.rule_id, finding.description));
-            discrepancies.push(finding);
+            } else {
+                trace.push("No contracted rate found covering this invoice's waste stream, facility and service date; expected amount and bill-level discrepancy cannot be computed - manual review required.".into());
+                discrepancies.push(DiscrepancyLine {
+                    discrepancy_type: DiscrepancyType::MissingSupport,
+                    description: "No contracted rate found covering this invoice's service date"
+                        .into(),
+                    amount: Money::zero(),
+                    rule_id: "RULE_00_NO_RATE".to_string(),
+                    confidence: Confidence::High,
+                });
+            }
             (PricingStatus::Uncomputable, None, None)
-        }
-    };
+        } else if unpriced_primary > 0 || unpriced_fee > 0 {
+            trace.push(format!(
+                "Pricing is PARTIAL: {} is a diagnostic subtotal only; {} primary line(s) and {} fee(s) unresolved",
+                expected, unpriced_primary, unpriced_fee
+            ));
+            (PricingStatus::Partial, None, Some(expected))
+        } else {
+            (PricingStatus::Complete, Some(expected), None)
+        };
 
+    // ---- Remaining existing rules (unchanged behaviour) ----
     if let Some(manifest) = &input.manifest {
         if let Some(d) = rules::check_waste_stream_mismatch(&input.invoice, manifest) {
             trace.push(format!("RULE {}: {}", d.rule_id, d.description));
@@ -176,7 +301,6 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
 
         if !incompatible_units.is_empty() {
             let units = incompatible_units.join(", ");
-
             let finding = DiscrepancyLine {
                 discrepancy_type: DiscrepancyType::Other,
                 description: format!(
@@ -187,7 +311,6 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
                 rule_id: rules::RULE_UNIT_MISMATCH.to_string(),
                 confidence: Confidence::Medium,
             };
-
             trace.push(format!("RULE {}: {}", finding.rule_id, finding.description));
             discrepancies.push(finding);
         }
@@ -215,7 +338,15 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         discrepancies.push(d);
     }
 
-    for d in rules::check_duplicate_charges(&input.invoice, usable_rate, &input.related_invoices) {
+    // Duplicate charges – pass None for rate because multi-rate attribution
+    // is already handled above; the helper still needs a rate for the
+    // "already_attributed" calculation. Using the first applicable rate (if any)
+    // preserves existing double-counting protection for the single-rate case.
+    // Pass None so already_attributed returns zero for every line.
+    // Rate-mismatch findings are already emitted only for counted primaries;
+    // the duplicate must therefore receive its full line_total.
+    for d in rules::check_duplicate_charges(&input.invoice, None, &input.related_invoices)
+    {
         trace.push(format!(
             "RULE {}: {} (amount: {})",
             d.rule_id, d.description, d.amount
@@ -235,7 +366,7 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         .fold(Money::zero(), |acc, d| acc + d.amount);
     let invoiced_amount = input.invoice.total;
     let expected_display = expected_amount
-        .map(|amount| amount.to_string())
+        .map(|a| a.to_string())
         .unwrap_or_else(|| "not computable".to_string());
     trace.push(format!(
         "Pricing status: {} | Expected amount: {} | Invoiced: {} | Identified finding amount (not necessarily total exposure): {}",
@@ -263,6 +394,7 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         partial_expected_amount,
         identified_finding_amount,
         discrepancies,
+        priced_lines,
         tolerances_applied: input.tolerances,
         review_status,
         calculation_trace: trace,
@@ -336,14 +468,173 @@ mod tests {
         ReconciliationInput {
             invoice,
             related_invoices: vec![],
-            applicable_rate: Some(rate),
-            stale_rate: None,
+            applicable_rates: vec![rate],
+            stale_rates: vec![],
             manifest: None,
             weight_ticket: None,
             tolerances: Tolerances::default(),
         }
     }
 
+    #[test]
+    fn multi_unit_invoice_prices_each_line_against_its_own_rate() {
+        // NES-TEST-1048 style:
+        // Disposal 10 ton @ $1,200  → contract $1,100/ton  → expected $11,000
+        // Transport 1 trip @ $1,000 → contract $1,000/trip → expected $1,000
+        // Handling 1 lot @ $350     → contract $350/lot    → expected $350
+        // Invoice total $13,350 ; expected total $12,350 ; discrepancy $1,000
+        let vendor = Uuid::new_v4();
+        let disposal_rate = ContractRate {
+            id: Uuid::new_v4(),
+            vendor_id: vendor,
+            waste_stream: "F003".into(),
+            facility_id: None,
+            unit_rate: Money::from_str_exact("1100.00").unwrap(),
+            unit: "ton".into(),
+            authorized_fees: vec![],
+            effective_from: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            effective_to: None,
+        };
+        let transport_rate = ContractRate {
+            id: Uuid::new_v4(),
+            vendor_id: vendor,
+            waste_stream: "F003".into(),
+            facility_id: None,
+            unit_rate: Money::from_str_exact("1000.00").unwrap(),
+            unit: "trip".into(),
+            authorized_fees: vec![],
+            effective_from: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            effective_to: None,
+        };
+        let handling_rate = ContractRate {
+            id: Uuid::new_v4(),
+            vendor_id: vendor,
+            waste_stream: "F003".into(),
+            facility_id: None,
+            unit_rate: Money::from_str_exact("350.00").unwrap(),
+            unit: "lot".into(),
+            authorized_fees: vec![],
+            effective_from: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            effective_to: None,
+        };
+
+        let disposal_line_id = Uuid::new_v4();
+        let transport_line_id = Uuid::new_v4();
+        let handling_line_id = Uuid::new_v4();
+
+        let invoice = Invoice {
+            id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            vendor_id: vendor,
+            invoice_number: "NES-TEST-1048".into(),
+            invoice_date: NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            service_date: NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+            facility_id: None,
+            waste_stream: "F003".into(),
+            line_items: vec![
+                InvoiceLineItem {
+                    id: disposal_line_id,
+                    description: "Disposal".into(),
+                    fee_code: None,
+                    quantity: Decimal::from(10),
+                    unit: "ton".into(),
+                    unit_price: Money::from_str_exact("1200.00").unwrap(),
+                    line_total: Money::from_str_exact("12000.00").unwrap(),
+                },
+                InvoiceLineItem {
+                    id: transport_line_id,
+                    description: "Transport".into(),
+                    fee_code: None,
+                    quantity: Decimal::from(1),
+                    unit: "trip".into(),
+                    unit_price: Money::from_str_exact("1000.00").unwrap(),
+                    line_total: Money::from_str_exact("1000.00").unwrap(),
+                },
+                InvoiceLineItem {
+                    id: handling_line_id,
+                    description: "Handling".into(),
+                    fee_code: None,
+                    quantity: Decimal::from(1),
+                    unit: "lot".into(),
+                    unit_price: Money::from_str_exact("350.00").unwrap(),
+                    line_total: Money::from_str_exact("350.00").unwrap(),
+                },
+            ],
+            total: Money::from_str_exact("13350.00").unwrap(),
+            source_document_id: None,
+        };
+
+        let input = ReconciliationInput {
+            invoice,
+            related_invoices: vec![],
+            applicable_rates: vec![disposal_rate.clone(), transport_rate.clone(), handling_rate.clone()],
+            stale_rates: vec![],
+            manifest: None,
+            weight_ticket: None,
+            tolerances: Tolerances::default(),
+        };
+
+        let result = run(&input);
+
+        assert_eq!(result.pricing_status, PricingStatus::Complete);
+        assert_eq!(
+            result.expected_amount,
+            Some(Money::from_str_exact("12350.00").unwrap())
+        );
+        assert_eq!(
+            result.invoiced_amount,
+            Money::from_str_exact("13350.00").unwrap()
+        );
+        assert_eq!(
+            result.discrepancy_amount,
+            Some(Money::from_str_exact("1000.00").unwrap())
+        );
+        assert_eq!(result.priced_lines.len(), 3);
+
+        let by_line: std::collections::HashMap<_, _> = result
+            .priced_lines
+            .iter()
+            .map(|p| (p.invoice_line_item_id, p))
+            .collect();
+
+        assert_eq!(
+            by_line[&disposal_line_id].expected_line_amount,
+            Money::from_str_exact("11000.00").unwrap()
+        );
+        assert_eq!(
+            by_line[&disposal_line_id].contract_rate_id,
+            disposal_rate.id
+        );
+        assert_eq!(
+            by_line[&transport_line_id].expected_line_amount,
+            Money::from_str_exact("1000.00").unwrap()
+        );
+        assert_eq!(
+            by_line[&transport_line_id].contract_rate_id,
+            transport_rate.id
+        );
+        assert_eq!(
+            by_line[&handling_line_id].expected_line_amount,
+            Money::from_str_exact("350.00").unwrap()
+        );
+        assert_eq!(
+            by_line[&handling_line_id].contract_rate_id,
+            handling_rate.id
+        );
+
+        // Only the disposal overcharge should appear as a rate-mismatch finding.
+        let rate_mismatches: Vec<_> = result
+            .discrepancies
+            .iter()
+            .filter(|d| d.rule_id == rules::RULE_RATE_MISMATCH)
+            .collect();
+        assert_eq!(rate_mismatches.len(), 1);
+        assert_eq!(
+            rate_mismatches[0].amount,
+            Money::from_str_exact("1000.00").unwrap()
+        );
+    }
+    
     #[test]
     fn full_engine_run_matches_spec_worked_example_exactly() {
         let input = build_input();
@@ -473,7 +764,7 @@ mod tests {
     #[test]
     fn missing_rate_does_not_panic_and_flags_for_review() {
         let mut input = build_input();
-        input.applicable_rate = None;
+        input.applicable_rates.clear();
         let result = run(&input);
         assert_eq!(result.review_status, ReviewStatus::New);
         assert_eq!(result.pricing_status, PricingStatus::Uncomputable);
@@ -620,9 +911,9 @@ mod tests {
     #[test]
     fn expired_rate_is_reported_but_never_prices_the_invoice() {
         let mut input = build_input();
-        let mut expired = input.applicable_rate.take().unwrap();
+        let mut expired = input.applicable_rates.remove(0);
         expired.effective_to = Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
-        input.stale_rate = Some(expired);
+        input.stale_rates = vec![expired];
         let r = run(&input);
         assert!(r
             .discrepancies
@@ -656,7 +947,7 @@ mod tests {
     #[test]
     fn expired_rate_passed_as_applicable_is_still_not_used_for_pricing() {
         let mut input = build_input();
-        input.applicable_rate.as_mut().unwrap().effective_to =
+        input.applicable_rates[0].effective_to =
             Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
         let r = run(&input);
         assert!(r
@@ -673,7 +964,7 @@ mod tests {
     #[test]
     fn missing_rate_states_that_the_expected_amount_is_not_computable() {
         let mut input = build_input();
-        input.applicable_rate = None;
+        input.applicable_rates.clear();
         let r = run(&input);
         let d = r
             .discrepancies
