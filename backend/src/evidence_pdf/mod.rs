@@ -356,10 +356,47 @@ pub fn render(
     }
 
     p.heading("2. Reconciliation result");
-    p.field("Expected amount", &money(s(r, "expected_amount")));
+    let raw_pricing_status = s(r, "pricing_status");
+    let pricing_status = if raw_pricing_status.is_empty() {
+        "LEGACY_UNVERIFIED"
+    } else {
+        raw_pricing_status
+    };
+    p.field("Pricing status", pricing_status);
+    let expected_display = if pricing_status == "COMPLETE" {
+        money(s(r, "expected_amount"))
+    } else if pricing_status == "PARTIAL" {
+        "Not computed (partial pricing only)".to_string()
+    } else {
+        "Not computed / not verified".to_string()
+    };
+    p.field("Expected amount", &expected_display);
+    if pricing_status == "PARTIAL" {
+        p.field(
+            "Partial expected subtotal (not the full expected amount)",
+            &money(s(r, "partial_expected_amount")),
+        );
+    }
     p.field("Invoiced amount", &money(s(r, "invoiced_amount")));
-    p.field("Total discrepancy", &money(s(r, "discrepancy_amount")));
+    let discrepancy_display = if pricing_status == "COMPLETE" {
+        money(s(r, "discrepancy_amount"))
+    } else {
+        "Not computed / not verified".to_string()
+    };
+    p.field("Bill-level discrepancy", &discrepancy_display);
+    if pricing_status != "LEGACY_UNVERIFIED" && !s(r, "identified_finding_amount").is_empty() {
+        p.field(
+            "Identified finding amount (not necessarily total exposure)",
+            &money(s(r, "identified_finding_amount")),
+        );
+    }
     p.field("Engine version", s(r, "engine_version"));
+    if pricing_status == "LEGACY_UNVERIFIED" {
+        p.para(
+            "The calculation trace below is retained from a historical run before pricing completeness was tracked. Any expected or discrepancy totals mentioned in it are unverified; rerun reconciliation before relying on those totals.",
+            0,
+        );
+    }
     p.para(
         "Calculation trace (deterministic engine, exact decimal arithmetic):",
         0,
@@ -579,7 +616,7 @@ mod tests {
     fn render_includes_every_section_and_exact_amounts() {
         let content = json!({
             "discrepancy": { "invoice_number": "INV-1", "vendor_name": "Acme", "description": "Invoiced at 450.0000/drum", "discrepancy_type": "RATE_MISMATCH", "rule_id": "RULE_03_RATE_MISMATCH", "amount": "500.0000", "confidence": "High", "review_status": "CONFIRMED" },
-            "reconciliation": { "expected_amount": "4500.0000", "invoiced_amount": "5200.0000", "discrepancy_amount": "700.0000", "engine_version": "1", "calculation_trace": ["Reconciling invoice INV-1"] },
+            "reconciliation": { "pricing_status": "COMPLETE", "expected_amount": "4500.0000", "invoiced_amount": "5200.0000", "discrepancy_amount": "700.0000", "identified_finding_amount": "700.0000", "engine_version": "1", "calculation_trace": ["Reconciling invoice INV-1"] },
             "invoice": { "invoice_number": "INV-1", "invoice_date": "2026-03-15", "service_date": "2026-03-10", "waste_stream": "F003", "total": "5200.0000",
                          "lines": [{ "description": "Drum disposal", "fee_code": null, "quantity": "10.0000", "unit_price": "450.0000", "line_total": "4500.0000" }] },
             "contract_rate": null, "manifest": null, "weight_tickets": [], "source_documents": []
@@ -601,4 +638,72 @@ mod tests {
             assert!(t.contains(needle), "PDF text is missing {needle:?}");
         }
     }
+    #[test]
+    fn incomplete_pricing_is_labeled_and_partial_subtotal_is_not_full_expected_amount() {
+        let content = json!({
+            "discrepancy": { "invoice_number": "INV-UNIT", "vendor_name": "Acme", "description": "Incompatible primary unit", "discrepancy_type": "OTHER", "rule_id": "RULE_UNIT_MISMATCH", "amount": "0.0000", "confidence": "Medium", "review_status": "NEW" },
+            "reconciliation": { "pricing_status": "PARTIAL", "expected_amount": null, "partial_expected_amount": "500.0000", "invoiced_amount": "5200.0000", "discrepancy_amount": null, "identified_finding_amount": "0.0000", "engine_version": "1", "calculation_trace": [] },
+            "invoice": { "invoice_number": "INV-UNIT", "invoice_date": "2026-03-15", "service_date": "2026-03-10", "waste_stream": "F003", "total": "5200.0000", "lines": [] },
+            "contract_rate": null, "manifest": null, "weight_tickets": [], "source_documents": []
+        });
+        let pdf = render("Org", "pkg", "2026-10-01", &content);
+        let rendered = String::from_utf8_lossy(&pdf).to_string();
+        assert!(rendered.contains("PARTIAL"));
+        assert!(rendered.contains(r"Not computed \(partial pricing only\)"));
+        assert!(rendered.contains("$500.00"));
+        assert!(rendered.contains("Partial expected subtotal"));
+        assert!(rendered.contains("Not computed / not verified"));
+    }
+
+
+    #[test]
+    fn legacy_pricing_hides_historical_totals_and_warns_the_reader() {
+        let content = json!({
+            "discrepancy": {
+                "invoice_number": "INV-LEGACY",
+                "vendor_name": "Acme",
+                "description": "Historical finding",
+                "discrepancy_type": "OTHER",
+                "rule_id": "RULE_LEGACY",
+                "amount": "0.0000",
+                "confidence": "Medium",
+                "review_status": "NEW"
+            },
+            "reconciliation": {
+                "pricing_status": "LEGACY_UNVERIFIED",
+                "expected_amount": "4500.0000",
+                "invoiced_amount": "5200.0000",
+                "discrepancy_amount": "700.0000",
+                "identified_finding_amount": "700.0000",
+                "engine_version": "legacy-v1",
+                "calculation_trace": [
+                    "Historical calculation retained for audit"
+                ]
+            },
+            "invoice": {
+                "invoice_number": "INV-LEGACY",
+                "invoice_date": "2026-03-15",
+                "service_date": "2026-03-10",
+                "waste_stream": "F003",
+                "total": "5200.0000",
+                "lines": []
+            },
+            "contract_rate": null,
+            "manifest": null,
+            "weight_tickets": [],
+            "source_documents": []
+        });
+
+        let pdf = render("Org", "legacy-pkg", "2026-10-20", &content);
+        let rendered = String::from_utf8_lossy(&pdf);
+
+        assert!(rendered.contains("LEGACY_UNVERIFIED"));
+        assert!(rendered.contains("Not computed / not verified"));
+        assert!(rendered.contains("historical run"));
+        assert!(rendered.contains("are unverified"));
+        assert!(rendered.contains("Historical calculation retained for audit"));
+        assert!(!rendered.contains("$4,500.00"));
+        assert!(!rendered.contains("$700.00"));
+    }
+
 }

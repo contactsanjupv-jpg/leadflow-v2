@@ -200,7 +200,7 @@ test("critical customer workflow", async (t) => {
       await rec.waitFor();
       await rec.getByText("$4,500.00").first().waitFor();
       await rec.getByText("$5,200.00").first().waitFor();
-      assert.match(await rec.innerText(), /Discrepancy\s*\$700\.00/);
+      assert.match(await rec.innerText(), /Bill-level discrepancy\s*\$700\.00/);
       await rec.getByText("RULE_03_RATE_MISMATCH").first().waitFor();
       await rec.getByText("RULE_04_UNAUTHORIZED_FEE").first().waitFor();
     });

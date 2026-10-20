@@ -170,12 +170,44 @@ pub enum ReviewStatus {
     Resolved,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PricingStatus {
+    /// Every primary invoice line could be priced from a rate effective on the service date.
+    Complete,
+    /// A contract rate exists, but one or more primary lines could not be priced because units differ.
+    Partial,
+    /// No rate effective on the service date is available; no contract-based expected amount can be stated.
+    Uncomputable,
+    /// Historical row created before pricing completeness was tracked. Its stored totals are not verified.
+    LegacyUnverified,
+}
+
+impl PricingStatus {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            PricingStatus::Complete => "COMPLETE",
+            PricingStatus::Partial => "PARTIAL",
+            PricingStatus::Uncomputable => "UNCOMPUTABLE",
+            PricingStatus::LegacyUnverified => "LEGACY_UNVERIFIED",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationResult {
     pub invoice_id: Uuid,
-    pub expected_amount: Money,
+    pub pricing_status: PricingStatus,
+    /// Present only when the expected amount is complete. Never a partial subtotal.
+    pub expected_amount: Option<Money>,
+    /// The invoice's stated total is known even when expected pricing is incomplete.
     pub invoiced_amount: Money,
-    pub discrepancy_amount: Money,
+    /// Present only when the expected amount is complete. This is the engine's priced discrepancy total.
+    pub discrepancy_amount: Option<Money>,
+    /// A diagnostic subtotal when only some expected components could be priced; never a full expected amount.
+    pub partial_expected_amount: Option<Money>,
+    /// Sum of dollar amounts attached to findings. This is not a complete bill-level discrepancy when pricing is incomplete.
+    pub identified_finding_amount: Money,
     pub discrepancies: Vec<DiscrepancyLine>,
     pub tolerances_applied: Tolerances,
     pub review_status: ReviewStatus,
@@ -183,8 +215,10 @@ pub struct ReconciliationResult {
 }
 
 impl ReconciliationResult {
+    /// Whether this run identified any non-zero dollar finding. This does not imply that total
+    /// invoice exposure is known; inspect `pricing_status` before using it as a bill-level amount.
     pub fn has_material_discrepancy(&self) -> bool {
-        !self.discrepancy_amount.is_zero()
+        !self.identified_finding_amount.is_zero()
     }
 }
 
@@ -283,6 +317,19 @@ mod db_mapping_tests {
             assert_eq!(ReviewStatus::from_db(s.as_db()), Some(s));
         }
         assert_eq!(ReviewStatus::from_db("bogus"), None);
+    }
+
+    #[test]
+    fn pricing_status_uses_stable_database_and_wire_labels() {
+        for (status, expected) in [
+            (PricingStatus::Complete, "COMPLETE"),
+            (PricingStatus::Partial, "PARTIAL"),
+            (PricingStatus::Uncomputable, "UNCOMPUTABLE"),
+            (PricingStatus::LegacyUnverified, "LEGACY_UNVERIFIED"),
+        ] {
+            assert_eq!(status.as_db(), expected);
+            assert_eq!(serde_json::to_string(&status).unwrap(), format!("\"{expected}\""));
+        }
     }
 
     #[test]

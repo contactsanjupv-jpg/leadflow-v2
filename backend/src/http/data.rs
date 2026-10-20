@@ -324,8 +324,13 @@ SELECT to_jsonb(i) || jsonb_build_object(
       SELECT id, description, fee_code, quantity::text AS quantity, unit, unit_price::text AS unit_price, line_total::text AS line_total
         FROM invoice_line_items WHERE invoice_id = i.id) l),
   'latest_reconciliation', (SELECT to_jsonb(r) FROM (
-      SELECT id, review_status::text AS review_status, expected_amount::text AS expected_amount, invoiced_amount::text AS invoiced_amount,
-             discrepancy_amount::text AS discrepancy_amount, created_at
+      SELECT id, review_status::text AS review_status, pricing_status,
+             CASE WHEN pricing_status = 'COMPLETE' THEN expected_amount::text ELSE NULL END AS expected_amount,
+             invoiced_amount::text AS invoiced_amount,
+             CASE WHEN pricing_status = 'COMPLETE' THEN discrepancy_amount::text ELSE NULL END AS discrepancy_amount,
+             CASE WHEN pricing_status = 'PARTIAL' THEN partial_expected_amount::text ELSE NULL END AS partial_expected_amount,
+             CASE WHEN pricing_status = 'LEGACY_UNVERIFIED' THEN NULL ELSE identified_finding_amount::text END AS identified_finding_amount,
+             created_at
         FROM reconciliations WHERE invoice_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1) r))
 FROM (SELECT id, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total::text AS total,
              source_document_id, manifest_id, created_at, updated_at FROM invoices WHERE id = $1) i"#;
@@ -439,9 +444,11 @@ pub async fn list_invoices(
     let v: Value = sqlx::query_scalar(
         r#"SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY t.invoice_date DESC, t.id), '[]'::jsonb) FROM (
              SELECT i.id, i.invoice_number, i.invoice_date, i.service_date, i.waste_stream, i.total::text AS total, i.vendor_id, v.name AS vendor_name,
-                    i.manifest_id, lr.review_status::text AS review_status, lr.discrepancy_amount::text AS discrepancy_amount
+                    i.manifest_id, lr.review_status::text AS review_status, lr.pricing_status,
+                    CASE WHEN lr.pricing_status = 'COMPLETE' THEN lr.discrepancy_amount::text ELSE NULL END AS discrepancy_amount,
+                    CASE WHEN lr.pricing_status = 'LEGACY_UNVERIFIED' THEN NULL ELSE lr.identified_finding_amount::text END AS identified_finding_amount
                FROM invoices i JOIN vendors v ON v.id = i.vendor_id
-               LEFT JOIN LATERAL (SELECT review_status, discrepancy_amount FROM reconciliations r WHERE r.invoice_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1) lr ON true
+               LEFT JOIN LATERAL (SELECT review_status, pricing_status, discrepancy_amount, identified_finding_amount FROM reconciliations r WHERE r.invoice_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1) lr ON true
               ORDER BY i.invoice_date DESC, i.id LIMIT $1 OFFSET $2) t"#,
     )
     .bind(page.limit())

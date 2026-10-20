@@ -15,8 +15,9 @@ export default function Dashboard() {
       <div className="grid">
         <Card><div className="stat"><div className="v">{d?.invoices_analyzed ?? "—"}</div><div className="l">Invoices analyzed</div></div></Card>
         <Card><div className="stat"><div className="v">{d?.requiring_review ?? "—"}</div><div className="l">Requiring review</div></div></Card>
-        <Card><div className="stat"><div className="v"><Money v={d?.potential_discrepancy_total} /></div><div className="l">Potential discrepancies (unreviewed)</div></div></Card>
-        <Card><div className="stat"><div className="v"><Money v={d?.confirmed_discrepancy_total} /></div><div className="l">Confirmed / disputed</div></div></Card>
+        <Card><div className="stat"><div className="v"><Money v={d?.potential_discrepancy_total} /></div><div className="l">Identified finding amounts (unreviewed)</div></div></Card>
+        <Card><div className="stat"><div className="v"><Money v={d?.confirmed_discrepancy_total} /></div><div className="l">Confirmed / disputed finding amounts</div></div></Card>
+        <Card><div className="stat"><div className="v">{d?.pricing_incomplete_count ?? "—"}</div><div className="l">Latest reconciliations with incomplete / unverified pricing</div></div></Card>
       </div>
       <Card title="Recovery">
         <Err e={rec.error} />
@@ -36,7 +37,7 @@ export default function Dashboard() {
         <Card title="Recent notifications">
           {(notes.data ?? []).length === 0 && <p className="muted">Nothing yet.</p>}
           {(notes.data ?? []).map((n: any) => (
-            <p key={n.id}><b>{n.event_type}</b> — {n.payload?.discrepancy_count} finding(s), <Money v={n.payload?.discrepancy_amount} /> <span className="muted">{new Date(n.created_at).toLocaleString()}</span></p>
+            <p key={n.id}><b>{n.event_type}</b> — {n.payload?.discrepancy_count} finding(s), identified finding amount <Money v={n.payload?.identified_finding_amount} />; complete-priced discrepancy total <Money v={n.payload?.complete_discrepancy_amount} />; {n.payload?.incomplete_pricing_invoice_count === undefined ? "pricing completeness not recorded" : `${n.payload.incomplete_pricing_invoice_count} invoice(s) with incomplete pricing`} <span className="muted">{new Date(n.created_at).toLocaleString()}</span></p>
           ))}
         </Card>
       </div>

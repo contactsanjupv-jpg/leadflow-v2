@@ -164,8 +164,13 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
             .fetch_one(&mut **tx)
             .await?;
     let reconciliation: Value = sqlx::query_scalar(
-        "SELECT to_jsonb(r) FROM (SELECT id, invoice_id, contract_rate_id, manifest_id, weight_record_id, expected_amount::text AS expected_amount, invoiced_amount::text AS invoiced_amount,
-                discrepancy_amount::text AS discrepancy_amount, tolerances_applied, calculation_trace, engine_version, created_at FROM reconciliations WHERE id = $1) r",
+        "SELECT to_jsonb(r) FROM (SELECT id, invoice_id, contract_rate_id, manifest_id, weight_record_id, pricing_status,
+                CASE WHEN pricing_status = 'COMPLETE' THEN expected_amount::text ELSE NULL END AS expected_amount,
+                invoiced_amount::text AS invoiced_amount,
+                CASE WHEN pricing_status = 'COMPLETE' THEN discrepancy_amount::text ELSE NULL END AS discrepancy_amount,
+                CASE WHEN pricing_status = 'PARTIAL' THEN partial_expected_amount::text ELSE NULL END AS partial_expected_amount,
+                CASE WHEN pricing_status = 'LEGACY_UNVERIFIED' THEN NULL ELSE identified_finding_amount::text END AS identified_finding_amount,
+                tolerances_applied, calculation_trace, engine_version, created_at FROM reconciliations WHERE id = $1) r",
     ).bind(rec_id).fetch_one(&mut **tx).await?;
     let invoice_id: Uuid = discrepancy["invoice_id"]
         .as_str()

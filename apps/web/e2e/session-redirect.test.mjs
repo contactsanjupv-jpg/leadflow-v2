@@ -20,18 +20,37 @@ async function launch() {
 }
 
 /** Navigate and return the redirect responses seen. A real loop makes goto() throw ERR_TOO_MANY_REDIRECTS. */
-async function visit(page, path) {
+async function visit(page, path, expectedUrl) {
   const redirects = [];
-  const onResponse = (r) => { if (r.status() >= 300 && r.status() < 400) redirects.push(`${r.status()} ${new URL(r.url()).pathname}${new URL(r.url()).search}`); };
+  const onResponse = (r) => {
+    if (r.status() >= 300 && r.status() < 400) {
+      redirects.push(`${r.status()} ${new URL(r.url()).pathname}${new URL(r.url()).search}`);
+    }
+  };
+
   page.on("response", onResponse);
   try {
-    await page.goto(`${WEB}${path}`, { waitUntil: "load", timeout: 30000 });
+    try {
+      await page.goto(`${WEB}${path}`, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+    } catch (e) {
+      // Next.js may interrupt the initial navigation while a redirect takes over.
+      // The expected final URL below remains mandatory.
+      if (!String(e.message).includes("ERR_ABORTED")) throw e;
+    }
+
+    await page.waitForURL(expectedUrl, { timeout: 10000 });
+    return redirects;
   } catch (e) {
-    assert.fail(`navigating to ${path} did not settle (redirect loop?): ${e.message}; redirects so far: ${redirects.join(" | ")}`);
+    assert.fail(
+      `navigation from ${path} did not reach its expected destination: ${e.message}; ` +
+      `final URL: ${page.url()}; redirects: ${redirects.join(" | ")}`
+    );
   } finally {
     page.off("response", onResponse);
   }
-  return redirects;
 }
 
 async function signUp(page, email) {
@@ -73,7 +92,7 @@ test("garbage/stale cookie: no loop on /, a protected page, or /login; lands on 
   withPage(async ({ ctx, page }) => {
     await ctx.addCookies([{ name: "xflow_session", value: "stale-or-forged-session-token", url: WEB, httpOnly: true, sameSite: "Lax" }]);
     for (const path of ["/", "/invoices", "/login"]) {
-      const redirects = await visit(page, path);
+      const redirects = await visit(page, path, (url) => url.pathname === "/login" && url.searchParams.get("expired") === "1");
       await assertOnExpiredLogin(page, redirects);
     }
   }));
@@ -86,15 +105,18 @@ test("a REAL session revoked server-side (expired) lands on login without loopin
     assert.ok(cookie, "signup must set the session cookie");
     const out = await fetch(`${API}/api/v1/auth/logout`, { method: "POST", headers: { authorization: `Bearer ${cookie.value}` } });
     assert.ok(out.ok, `API logout failed: ${out.status}`);
+  await page.close();
     assert.ok(await sessionCookie(ctx), "browser still holds the now-invalid cookie");
-    const redirects = await visit(page, "/");
-    await assertOnExpiredLogin(page, redirects);
+    const expiredPage = await ctx.newPage();
+  expiredPage.setDefaultTimeout(20000);
+  const redirects = await visit(expiredPage, "/", (url) => url.pathname === "/login" && url.searchParams.get("expired") === "1");
+  await assertOnExpiredLogin(expiredPage, redirects);
     // recovery: logging in from the expired landing page replaces the stale cookie
-    await page.getByLabel("Email").fill(email);
-    await page.getByLabel(/Password/).fill(PASSWORD);
-    await page.getByRole("button", { name: "Log in" }).click();
-    await page.waitForURL(`${WEB}/`);
-    await page.getByRole("heading", { name: "Dashboard" }).waitFor();
+    await expiredPage.getByLabel("Email").fill(email);
+    await expiredPage.getByLabel(/Password/).fill(PASSWORD);
+    await expiredPage.getByRole("button", { name: "Log in" }).click();
+    await expiredPage.waitForURL(`${WEB}/`);
+    await expiredPage.getByRole("heading", { name: "Dashboard" }).waitFor();
     assert.notEqual((await sessionCookie(ctx)).value, cookie.value, "login must replace the stale cookie");
   }));
 
@@ -102,11 +124,11 @@ test("valid session and normal login still work; anonymous visitors are still bl
   withPage(async ({ ctx, page }) => {
     const email = `loop-valid-${Date.now()}@example.test`;
     await signUp(page, email);
-    await visit(page, "/invoices");
+    await visit(page, "/invoices", (url) => url.pathname === "/invoices");
     assert.equal(new URL(page.url()).pathname, "/invoices");
     await page.getByRole("button", { name: "Log out" }).waitFor();
     // a logged-in user opening /login is still sent straight to the app
-    const r = await visit(page, "/login");
+    const r = await visit(page, "/login", (url) => url.pathname === "/");
     assert.equal(new URL(page.url()).pathname, "/", `expected redirect to app, got ${page.url()} via ${r.join(" | ")}`);
     await page.getByRole("button", { name: "Log out" }).waitFor();
     // log out -> login page, cookie gone
@@ -122,7 +144,7 @@ test("valid session and normal login still work; anonymous visitors are still bl
     // an anonymous visitor (cookie cleared) is still blocked from protected pages with the plain login page.
     // (Same context on purpose: the bundled Chromium runs --single-process, so closing a 2nd context kills the browser.)
     await ctx.clearCookies();
-    await visit(page, "/invoices");
+    await visit(page, "/invoices", (url) => url.pathname === "/login" && !url.searchParams.has("expired"));
     assert.equal(new URL(page.url()).pathname, "/login");
     assert.equal(new URL(page.url()).searchParams.get("expired"), null, "anonymous bounce is the plain login page");
     assert.equal(await page.getByRole("button", { name: "Log out" }).count(), 0);

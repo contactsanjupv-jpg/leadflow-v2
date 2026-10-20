@@ -142,6 +142,7 @@ async fn capitalization_and_whitespace_do_not_hide_a_valid_rate() {
             !rules.contains(&"RULE_00_NO_RATE".to_string()),
             "{spelling:?} lost its rate: {r}"
         );
+        assert_eq!(r["pricing_status"], "COMPLETE", "{spelling:?}: {r}");
         assert_eq!(r["expected_amount"], "4500.0000", "{spelling:?}: {r}");
         assert_eq!(r["invoiced_amount"], "5200.0000");
         assert_eq!(r["discrepancy_amount"], "700.0000", "{spelling:?}: {r}");
@@ -169,6 +170,7 @@ async fn rate_stored_in_lowercase_matches_an_uppercase_invoice() {
     assert!(s.is_success(), "{b}");
     let inv = worked_invoice(&app, &org, &vid, "INV-R1", "F003", "2026-03-10", None).await;
     let r = run(&app, &org, &inv).await;
+    assert_eq!(r["pricing_status"], "COMPLETE", "{r}");
     assert_eq!(r["expected_amount"], "4500.0000", "{r}");
     assert_eq!(r["discrepancy_amount"], "700.0000");
 }
@@ -223,10 +225,9 @@ async fn genuinely_missing_rate_is_flagged_and_not_priced() {
         1,
         "{r}"
     );
-    assert_eq!(
-        r["discrepancy_amount"], "0.0000",
-        "no dollar amount may be invented: {r}"
-    );
+    assert!(r["expected_amount"].is_null(), "no rate means expected amount is uncomputable: {r}");
+    assert!(r["discrepancy_amount"].is_null(), "no bill-level discrepancy may be asserted: {r}");
+    assert_eq!(r["pricing_status"], "UNCOMPUTABLE", "{r}");
     assert_ne!(r["review_status"], "RESOLVED", "must require review: {r}");
     assert_eq!(
         applied_rate_id(&app, &org, &r).await,
@@ -263,7 +264,9 @@ async fn expired_rate_is_reported_and_never_prices_the_invoice() {
         !rules.contains(&"RULE_04_UNAUTHORIZED_FEE".to_string()),
         "expired rate priced the fees: {r}"
     );
-    assert_eq!(r["discrepancy_amount"], "0.0000");
+    assert!(r["expected_amount"].is_null(), "expired rate must not produce an expected amount: {r}");
+    assert!(r["discrepancy_amount"].is_null(), "expired rate must not produce a bill-level discrepancy: {r}");
+    assert_eq!(r["pricing_status"], "UNCOMPUTABLE", "{r}");
     assert_ne!(r["review_status"], "RESOLVED");
     assert_eq!(
         applied_rate_id(&app, &org, &r).await,

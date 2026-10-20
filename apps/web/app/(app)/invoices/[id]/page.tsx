@@ -35,11 +35,20 @@ export default function InvoiceDetail() {
           </Card>
           {r && (
             <Card title="Latest reconciliation">
-              <div className="row"><div>Expected <b><Money v={r.expected_amount} /></b></div><div>Invoiced <b><Money v={r.invoiced_amount} /></b></div><div>Discrepancy <b><Money v={r.discrepancy_amount} /></b></div><Badge s={r.review_status} /></div>
+              <div className="row">
+                <div>Expected <b>{r.pricing_status === "COMPLETE" ? <Money v={r.expected_amount} /> : "Not computed / not verified"}</b></div>
+                <div>Invoiced <b><Money v={r.invoiced_amount} /></b></div>
+                <div>{r.pricing_status === "COMPLETE" ? "Bill-level discrepancy" : "Identified finding amount"} <b><Money v={r.pricing_status === "COMPLETE" ? r.discrepancy_amount : r.identified_finding_amount} /></b></div>
+                <Badge s={r.review_status} />
+                <Badge s={r.pricing_status} />
+              </div>
+              {r.pricing_status === "PARTIAL" && <p className="muted">Partial expected subtotal: <b><Money v={r.partial_expected_amount} /></b>. This is only the amount that could be priced; it is not the full invoice expected amount. The bill-level discrepancy is not computed until the unit mismatch is resolved.</p>}
+              {r.pricing_status === "UNCOMPUTABLE" && <p className="muted">No contract rate effective on the service date was available. The expected amount and bill-level discrepancy cannot be computed. Resolve rate coverage and rerun reconciliation.</p>}
+              {r.pricing_status === "LEGACY_UNVERIFIED" && <p className="muted">This is a historical reconciliation created before pricing completeness was tracked. Its prior expected amount and bill-level discrepancy are not verified; rerun reconciliation to calculate them under the current rules.</p>}
               <table><thead><tr><th>Finding</th><th>Rule</th><th className="num">Amount</th><th>Status</th></tr></thead>
                 <tbody>{r.discrepancies.map((d: any) => <tr key={d.id}><td><Link href="/review">{d.description}</Link></td><td className="muted">{d.rule_id}</td><td className="num"><Money v={d.amount} /></td><td><Badge s={d.review_status} /></td></tr>)}
                   {r.discrepancies.length === 0 && <tr><td colSpan={4} className="muted">No discrepancies found.</td></tr>}</tbody></table>
-              <details><summary>Calculation trace</summary><pre>{(r.calculation_trace as string[]).join("\n")}</pre></details>
+              <details><summary>{r.pricing_status === "LEGACY_UNVERIFIED" ? "Historical calculation trace (unverified)" : "Calculation trace"}</summary><pre>{(r.calculation_trace as string[]).join("\n")}</pre></details>
             </Card>
           )}
         </>

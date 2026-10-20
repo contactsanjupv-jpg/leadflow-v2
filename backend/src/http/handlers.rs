@@ -195,7 +195,13 @@ pub async fn run_reconciliation(
     let outcome = service::run_for_invoice(&mut tx, user.organization_id, req.invoice_id).await?;
     crate::audit::record(
         &mut tx, user.organization_id, Some(user.user_id), "reconciliation.run", "reconciliation", Some(outcome.reconciliation_id), None,
-        Some(json!({ "invoice_id": req.invoice_id, "discrepancy_amount": outcome.result.discrepancy_amount.to_wire_string(), "discrepancy_count": outcome.discrepancy_ids.len() })),
+        Some(json!({
+            "invoice_id": req.invoice_id,
+            "pricing_status": outcome.result.pricing_status.as_db(),
+            "discrepancy_amount": outcome.result.discrepancy_amount.map(|amount| amount.to_wire_string()),
+            "identified_finding_amount": outcome.result.identified_finding_amount.to_wire_string(),
+            "discrepancy_count": outcome.discrepancy_ids.len()
+        })),
     )
     .await?;
     tx.commit().await?;
@@ -212,8 +218,13 @@ const RECONCILIATION_DETAIL_SQL: &str = r#"
 SELECT to_jsonb(r) || jsonb_build_object('discrepancies', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.created_at, d.id), '[]'::jsonb) FROM (
     SELECT id, discrepancy_type::text AS discrepancy_type, rule_id, description, amount::text AS amount, confidence, review_status::text AS review_status,
            reviewed_by, reviewed_at, review_notes, created_at FROM discrepancies WHERE reconciliation_id = r.id) d))
-FROM (SELECT id, invoice_id, contract_rate_id, manifest_id, weight_record_id, expected_amount::text AS expected_amount, invoiced_amount::text AS invoiced_amount,
-             discrepancy_amount::text AS discrepancy_amount, review_status::text AS review_status, tolerances_applied, calculation_trace, engine_version, created_at
+FROM (SELECT id, invoice_id, contract_rate_id, manifest_id, weight_record_id, pricing_status,
+             CASE WHEN pricing_status = 'COMPLETE' THEN expected_amount::text ELSE NULL END AS expected_amount,
+             invoiced_amount::text AS invoiced_amount,
+             CASE WHEN pricing_status = 'COMPLETE' THEN discrepancy_amount::text ELSE NULL END AS discrepancy_amount,
+             CASE WHEN pricing_status = 'PARTIAL' THEN partial_expected_amount::text ELSE NULL END AS partial_expected_amount,
+             CASE WHEN pricing_status = 'LEGACY_UNVERIFIED' THEN NULL ELSE identified_finding_amount::text END AS identified_finding_amount,
+             review_status::text AS review_status, tolerances_applied, calculation_trace, engine_version, created_at
         FROM reconciliations WHERE id = $1) r"#;
 
 pub async fn get_reconciliation(
@@ -239,8 +250,13 @@ pub async fn list_reconciliations(
     let v: serde_json::Value = sqlx::query_scalar(
         r#"SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY t.created_at DESC, t.id), '[]'::jsonb) FROM (
              SELECT * FROM (
-               SELECT DISTINCT ON (r.invoice_id) r.id, r.invoice_id, i.invoice_number, i.vendor_id, v.name AS vendor_name, r.expected_amount::text AS expected_amount,
-                      r.invoiced_amount::text AS invoiced_amount, r.discrepancy_amount::text AS discrepancy_amount, r.review_status::text AS review_status, r.created_at
+               SELECT DISTINCT ON (r.invoice_id) r.id, r.invoice_id, i.invoice_number, i.vendor_id, v.name AS vendor_name, r.pricing_status,
+                      CASE WHEN r.pricing_status = 'COMPLETE' THEN r.expected_amount::text ELSE NULL END AS expected_amount,
+                      r.invoiced_amount::text AS invoiced_amount,
+                      CASE WHEN r.pricing_status = 'COMPLETE' THEN r.discrepancy_amount::text ELSE NULL END AS discrepancy_amount,
+                      CASE WHEN r.pricing_status = 'PARTIAL' THEN r.partial_expected_amount::text ELSE NULL END AS partial_expected_amount,
+                      CASE WHEN r.pricing_status = 'LEGACY_UNVERIFIED' THEN NULL ELSE r.identified_finding_amount::text END AS identified_finding_amount,
+                      r.review_status::text AS review_status, r.created_at
                  FROM reconciliations r JOIN invoices i ON i.id = r.invoice_id JOIN vendors v ON v.id = i.vendor_id
                 ORDER BY r.invoice_id, r.created_at DESC, r.id DESC) latest
              ORDER BY created_at DESC, id LIMIT $1 OFFSET $2) t"#,
@@ -262,14 +278,17 @@ pub async fn get_dashboard(
     // Amounts are summed by PostgreSQL NUMERIC (exact) and returned as fixed 4-decimal text.
     let v: serde_json::Value = sqlx::query_scalar(
         r#"WITH latest AS (
-             SELECT DISTINCT ON (invoice_id) id, invoice_id, review_status FROM reconciliations ORDER BY invoice_id, created_at DESC, id DESC)
+             SELECT DISTINCT ON (invoice_id) id, invoice_id, review_status, pricing_status FROM reconciliations ORDER BY invoice_id, created_at DESC, id DESC)
            SELECT jsonb_build_object(
              'invoices_analyzed', (SELECT count(*) FROM latest),
              'requiring_review', (SELECT count(*) FROM latest WHERE review_status IN ('NEW', 'UNDER_REVIEW', 'NEEDS_INFORMATION')),
+             'pricing_incomplete_count', (SELECT count(*) FROM latest WHERE pricing_status <> 'COMPLETE'),
              'potential_discrepancy_total', (SELECT coalesce(sum(d.amount), 0)::numeric(20,4)::text FROM discrepancies d JOIN latest l ON l.id = d.reconciliation_id
-                                              WHERE d.amount > 0 AND d.review_status IN ('NEW', 'UNDER_REVIEW', 'NEEDS_INFORMATION')),
+                                              WHERE l.pricing_status <> 'LEGACY_UNVERIFIED'
+                                                 AND d.amount > 0 AND d.review_status IN ('NEW', 'UNDER_REVIEW', 'NEEDS_INFORMATION')),
              'confirmed_discrepancy_total', (SELECT coalesce(sum(d.amount), 0)::numeric(20,4)::text FROM discrepancies d JOIN latest l ON l.id = d.reconciliation_id
-                                              WHERE d.amount > 0 AND d.review_status IN ('CONFIRMED', 'DISPUTED')))"#,
+                                              WHERE l.pricing_status <> 'LEGACY_UNVERIFIED'
+                                                 AND d.amount > 0 AND d.review_status IN ('CONFIRMED', 'DISPUTED')))"#,
     )
     .fetch_one(&mut *tx)
     .await?;

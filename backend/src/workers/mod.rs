@@ -71,7 +71,9 @@ pub async fn run_reconcile_pending(
 
     let mut processed = 0usize;
     let mut new_findings = 0usize;
-    let mut total_amount = crate::common::money::Money::zero();
+    let mut complete_discrepancy_total = crate::common::money::Money::zero();
+    let mut identified_finding_total = crate::common::money::Money::zero();
+    let mut incomplete_pricing_invoice_count = 0usize;
     for id in &ids {
         let mut tx = crate::tenants::begin_scoped_tx(pool, organization_id).await?;
         let outcome = service::run_for_invoice(&mut tx, organization_id, *id).await?;
@@ -81,14 +83,32 @@ pub async fn run_reconcile_pending(
         processed += 1;
         if !outcome.result.discrepancies.is_empty() {
             new_findings += outcome.result.discrepancies.len();
-            total_amount = total_amount + outcome.result.discrepancy_amount;
+            identified_finding_total = identified_finding_total + outcome.result.identified_finding_amount;
+        }
+        match outcome.result.pricing_status {
+            crate::reconciliation::model::PricingStatus::Complete => {
+                if let Some(amount) = outcome.result.discrepancy_amount {
+                    complete_discrepancy_total = complete_discrepancy_total + amount;
+                }
+            }
+            crate::reconciliation::model::PricingStatus::Partial
+            | crate::reconciliation::model::PricingStatus::Uncomputable
+            | crate::reconciliation::model::PricingStatus::LegacyUnverified => {
+                incomplete_pricing_invoice_count += 1;
+            }
         }
     }
     if new_findings > 0 {
         let mut tx = crate::tenants::begin_scoped_tx(pool, organization_id).await?;
         sqlx::query("INSERT INTO notifications (organization_id, event_type, payload) VALUES ($1, 'discrepancies.detected', $2)")
             .bind(organization_id)
-            .bind(serde_json::json!({ "invoices_processed": processed, "discrepancy_count": new_findings, "discrepancy_amount": total_amount.to_wire_string() }))
+            .bind(serde_json::json!({
+                "invoices_processed": processed,
+                "discrepancy_count": new_findings,
+                "complete_discrepancy_amount": complete_discrepancy_total.to_wire_string(),
+                "identified_finding_amount": identified_finding_total.to_wire_string(),
+                "incomplete_pricing_invoice_count": incomplete_pricing_invoice_count
+            }))
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;

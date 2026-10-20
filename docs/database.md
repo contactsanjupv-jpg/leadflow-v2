@@ -1,5 +1,5 @@
 # Database
-Migrations 0001–0004 in `migrations/` (never edit applied files; add 0005+). 0002 enables FORCE RLS on tenant tables and creates `xflow_app`; 0003 adds invoice→manifest link, rate-window exclusion constraint, document hashes, monitoring job functions; 0004 adds a case-insensitive unique email index. Apply with `scripts/migrate.sh` (tracked, idempotent) using a privileged role.
+Migrations 0001–0007 in `migrations/` (never edit applied files; add the next numbered migration). 0002 enables FORCE RLS on tenant tables and creates `xflow_app`; 0003 adds invoice→manifest link, rate-window exclusion constraint, document hashes, monitoring job functions; 0004 adds a case-insensitive unique email index. Apply with `scripts/migrate.sh` (tracked, idempotent) using a privileged role.
 
 ## Date plausibility (migration 0005)
 All business dates must have a year in 1900-2100 (backend `common::dates`, CHECK constraints, frontend `DateInput`). The constraints are `NOT VALID`, so rows saved before the migration are untouched. Find and repair old bad rows (e.g. a year typed as `0206`), then validate:
@@ -14,3 +14,6 @@ UNION ALL SELECT 'contract_rates(to)', id, effective_to FROM contract_rates WHER
 -- UPDATE manifests SET shipment_date = '2026-12-09' WHERE id = '...';   -- (run as a privileged role; RLS applies to xflow_app)
 -- ALTER TABLE manifests VALIDATE CONSTRAINT manifests_shipment_date_plausible;
 ```
+
+## Reconciliation pricing status (migration 0007)
+`reconciliations.pricing_status` tracks whether the full bill could be priced. `expected_amount` and `discrepancy_amount` are nullable so partial or uncomputable runs do not fabricate a bill-level number. `partial_expected_amount` stores a diagnostic subtotal for partial runs; `identified_finding_amount` stores the sum of monetary amounts attached to findings. Pre-migration rows are marked `LEGACY_UNVERIFIED`; their old totals are retained in storage for auditability, but reconciliation, invoice and evidence APIs suppress those amounts as verified totals until the invoice is reconciled again.

@@ -37,16 +37,17 @@ export default function Invoices() {
       <Card title="Invoices">
         <Err e={list.error} />
         <table>
-          <thead><tr><th>Invoice</th><th>Vendor</th><th>Service date</th><th className="num">Total</th><th>Status</th><th className="num">Discrepancy</th></tr></thead>
+          <thead><tr><th>Invoice</th><th>Vendor</th><th>Service date</th><th className="num">Total</th><th>Status</th><th>Pricing</th><th className="num">Bill-level discrepancy</th></tr></thead>
           <tbody>
             {(list.data ?? []).map((i: any) => (
               <tr key={i.id}>
                 <td><Link href={`/invoices/${i.id}`}>{i.invoice_number}</Link></td><td>{i.vendor_name}</td><td>{i.service_date}</td>
                 <td className="num"><Money v={i.total} /></td><td>{i.review_status ? <Badge s={i.review_status} /> : <span className="muted">not reconciled</span>}</td>
-                <td className="num"><Money v={i.discrepancy_amount} /></td>
+                <td>{i.pricing_status ? <Badge s={i.pricing_status} /> : <span className="muted">not reconciled</span>}</td>
+                <td className="num">{i.pricing_status === "COMPLETE" ? <Money v={i.discrepancy_amount} /> : <span className="muted">Not computed / not verified</span>}</td>
               </tr>
             ))}
-            {list.data?.length === 0 && <tr><td colSpan={6} className="muted">No invoices yet. Enter one below.</td></tr>}
+            {list.data?.length === 0 && <tr><td colSpan={7} className="muted">No invoices yet. Enter one below.</td></tr>}
           </tbody>
         </table>
       </Card>

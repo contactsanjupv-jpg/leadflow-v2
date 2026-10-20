@@ -22,7 +22,7 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         None => (None, input.stale_rate.as_ref()),
     };
 
-    let expected_amount = match usable_rate {
+    let (pricing_status, expected_amount, partial_expected_amount) = match usable_rate {
         Some(rate) => {
             trace.push(format!(
                 "Matched contract rate {}/{} effective {} - {}",
@@ -80,7 +80,7 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
 
             let mut expected = rate.unit_rate * primary_qty;
             trace.push(format!(
-                "Expected primary line: {} {} x {} / {} = {}",
+                "Expected primary line subtotal: {} {} x {} / {} = {}",
                 primary_qty, rate.unit, rate.unit_rate, rate.unit, expected
             ));
 
@@ -106,25 +106,31 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
                     }
                 }
             }
-            expected
+
+            if incompatible_primary_count > 0 {
+                trace.push(format!(
+                    "Pricing is PARTIAL: {} is a diagnostic subtotal only, not the full invoice expected amount; the full expected amount and bill-level discrepancy cannot be computed until the unit mismatch is resolved.",
+                    expected
+                ));
+                (PricingStatus::Partial, None, Some(expected))
+            } else {
+                (PricingStatus::Complete, Some(expected), None)
+            }
         }
         None => {
-            // No usable rate: the expected amount cannot be computed. It is shown equal to the
-            // invoiced amount ONLY because the stored amount is non-null; no dollar discrepancy is
-            // asserted and the finding below forces human review.
+            // An absent or expired rate never produces an expected amount or bill-level discrepancy.
             let finding = match expired_rate
                 .and_then(|r| rules::check_stale_rate(&input.invoice, r))
             {
                 Some(stale) => {
-                    trace.push(format!(
-                        "Contract rate for this stream expired before the service date and was not used for pricing: expected amount cannot be computed."
-                    ));
+                    trace.push(
+                        "Contract rate for this stream expired before the service date and was not used for pricing; expected amount and bill-level discrepancy cannot be computed.".into(),
+                    );
                     stale
                 }
                 None => {
-                    // Detail lives in the trace, NOT in the finding description: carry-forward of review
-                    // decisions matches on the description, which must stay the baseline text.
-                    trace.push("No contracted rate found covering this invoice's waste stream, facility and service date; the expected amount cannot be computed (shown equal to the invoiced amount, so no dollar discrepancy is asserted) - manual review required.".into());
+                    // Keep this description stable: review-decision carry-forward matches on it.
+                    trace.push("No contracted rate found covering this invoice's waste stream, facility and service date; expected amount and bill-level discrepancy cannot be computed - manual review required.".into());
                     DiscrepancyLine {
                         discrepancy_type: DiscrepancyType::MissingSupport,
                         description:
@@ -137,7 +143,7 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
             };
             trace.push(format!("RULE {}: {}", finding.rule_id, finding.description));
             discrepancies.push(finding);
-            input.invoice.total
+            (PricingStatus::Uncomputable, None, None)
         }
     };
 
@@ -224,13 +230,16 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         discrepancies.push(d);
     }
 
-    let dollar_discrepancy: Money = discrepancies
+    let identified_finding_amount: Money = discrepancies
         .iter()
         .fold(Money::zero(), |acc, d| acc + d.amount);
     let invoiced_amount = input.invoice.total;
+    let expected_display = expected_amount
+        .map(|amount| amount.to_string())
+        .unwrap_or_else(|| "not computable".to_string());
     trace.push(format!(
-        "Expected: {} | Invoiced: {} | Sum of dollar-quantified discrepancy lines: {}",
-        expected_amount, invoiced_amount, dollar_discrepancy
+        "Pricing status: {} | Expected amount: {} | Invoiced: {} | Identified finding amount (not necessarily total exposure): {}",
+        pricing_status.as_db(), expected_display, invoiced_amount, identified_finding_amount
     ));
 
     let review_status = if discrepancies.is_empty() {
@@ -239,11 +248,20 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         ReviewStatus::New
     };
 
+    let discrepancy_amount = if pricing_status == PricingStatus::Complete {
+        Some(identified_finding_amount)
+    } else {
+        None
+    };
+
     ReconciliationResult {
         invoice_id: input.invoice.id,
+        pricing_status,
         expected_amount,
         invoiced_amount,
-        discrepancy_amount: dollar_discrepancy,
+        discrepancy_amount,
+        partial_expected_amount,
+        identified_finding_amount,
         discrepancies,
         tolerances_applied: input.tolerances,
         review_status,
@@ -330,9 +348,10 @@ mod tests {
     fn full_engine_run_matches_spec_worked_example_exactly() {
         let input = build_input();
         let result = run(&input);
+        assert_eq!(result.pricing_status, PricingStatus::Complete);
         assert_eq!(
             result.expected_amount,
-            Money::from_str_exact("4500.00").unwrap()
+            Some(Money::from_str_exact("4500.00").unwrap())
         );
         assert_eq!(
             result.invoiced_amount,
@@ -340,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             result.discrepancy_amount,
-            Money::from_str_exact("700.00").unwrap()
+            Some(Money::from_str_exact("700.00").unwrap())
         );
         assert!(result.has_material_discrepancy());
         assert_eq!(result.review_status, ReviewStatus::New);
@@ -413,12 +432,18 @@ mod tests {
 
         let result = run(&input);
 
-        // Only the authorized $500 transport fee remains in this fixture's
-        // calculable expected amount; the kg quantity is not priced per drum.
+        // The fee-only subtotal is diagnostic; it must not be exposed as the full expected amount.
+        assert_eq!(result.pricing_status, PricingStatus::Partial);
+        assert_eq!(result.expected_amount, None);
         assert_eq!(
-            result.expected_amount,
-            Money::from_str_exact("500.00").unwrap()
+            result.partial_expected_amount,
+            Some(Money::from_str_exact("500.00").unwrap())
         );
+        assert_eq!(result.discrepancy_amount, None);
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["expected_amount"].is_null());
+        assert!(json["discrepancy_amount"].is_null());
+        assert_eq!(json["pricing_status"], "PARTIAL");
 
         assert!(
             result
@@ -451,6 +476,12 @@ mod tests {
         input.applicable_rate = None;
         let result = run(&input);
         assert_eq!(result.review_status, ReviewStatus::New);
+        assert_eq!(result.pricing_status, PricingStatus::Uncomputable);
+        assert_eq!(result.expected_amount, None);
+        assert_eq!(result.discrepancy_amount, None);
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["expected_amount"].is_null());
+        assert!(json["discrepancy_amount"].is_null());
         assert!(result
             .discrepancies
             .iter()
@@ -487,12 +518,47 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_primary_rate_mismatch_reconciles_to_bill_level_discrepancy() {
+        let mut input = build_input();
+
+        // Duplicate the $4,500 disposal line billed above the $400 contract rate.
+        let primary = input.invoice.line_items[0].clone();
+        input.invoice.line_items.push(InvoiceLineItem {
+            id: Uuid::new_v4(),
+            ..primary
+        });
+        input.invoice.total =
+            input.invoice.total + Money::from_str_exact("4500.00").unwrap();
+
+        let result = run(&input);
+
+        assert_eq!(result.pricing_status, PricingStatus::Complete);
+        assert_eq!(
+            result.expected_amount,
+            Some(Money::from_str_exact("4500.00").unwrap())
+        );
+        assert_eq!(
+            result.invoiced_amount,
+            Money::from_str_exact("9700.00").unwrap()
+        );
+        assert_eq!(
+            result.discrepancy_amount,
+            Some(Money::from_str_exact("5200.00").unwrap())
+        );
+        assert_eq!(
+            result.invoiced_amount - result.expected_amount.unwrap(),
+            result.discrepancy_amount.unwrap(),
+            "complete pricing must reconcile invoiced minus expected"
+        );
+    }
+
+    #[test]
     fn duplicate_and_stream_rules_run_in_the_engine_without_changing_the_worked_example() {
         // The spec worked example is unchanged: no duplicates, no manifest => still exactly $700.
         let base = run(&build_input());
         assert_eq!(
             base.discrepancy_amount,
-            Money::from_decimal(Decimal::from(700))
+            Some(Money::from_decimal(Decimal::from(700)))
         );
         assert!(base
             .discrepancies
@@ -523,12 +589,12 @@ mod tests {
         assert_eq!(d5.len(), 1);
         assert_eq!(
             r.discrepancy_amount,
-            Money::from_decimal(Decimal::from(1200))
+            Some(Money::from_decimal(Decimal::from(1200)))
         );
         assert_eq!(
-            r.invoiced_amount - r.expected_amount,
-            r.discrepancy_amount,
-            "findings must reconcile exactly to invoiced - expected"
+            r.invoiced_amount - r.expected_amount.unwrap(),
+            r.discrepancy_amount.unwrap(),
+            "complete-priced findings must reconcile exactly to invoiced - expected"
         );
 
         // Manifest with a different stream => RULE_08.
@@ -573,7 +639,9 @@ mod tests {
                     || d.rule_id == rules::RULE_UNAUTHORIZED_FEE),
             "expired rate must not generate priced findings"
         );
-        assert_eq!(r.discrepancy_amount, Money::zero());
+        assert_eq!(r.expected_amount, None);
+        assert_eq!(r.discrepancy_amount, None);
+        assert_eq!(r.pricing_status, PricingStatus::Uncomputable);
         assert_eq!(
             r.review_status,
             ReviewStatus::New,
@@ -599,7 +667,7 @@ mod tests {
             .discrepancies
             .iter()
             .any(|d| d.rule_id == rules::RULE_RATE_MISMATCH));
-        assert_eq!(r.discrepancy_amount, Money::zero());
+        assert_eq!(r.discrepancy_amount, None);
     }
 
     #[test]

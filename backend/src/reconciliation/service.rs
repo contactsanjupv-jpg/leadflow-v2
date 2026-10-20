@@ -1,7 +1,7 @@
 //! Reconciliation workflow service: load the real inputs for an invoice (rate, manifest, weight
 //! tickets), run the deterministic engine, and persist the reconciliation plus one
 //! `discrepancies` row per finding. Shared by the HTTP handler and the monitoring worker so
-//! both take exactly the same path. The engine itself is untouched.
+//! both take exactly the same path. Pricing completeness is surfaced by the engine and persisted here.
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -401,17 +401,20 @@ pub async fn run_for_invoice(
 
     let reconciliation_id: Uuid = sqlx::query_scalar(
         "INSERT INTO reconciliations
-           (organization_id, invoice_id, contract_rate_id, manifest_id, weight_record_id, expected_amount, invoiced_amount, discrepancy_amount, review_status, tolerances_applied, calculation_trace)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::review_status, $10, $11) RETURNING id",
+           (organization_id, invoice_id, contract_rate_id, manifest_id, weight_record_id, expected_amount, invoiced_amount, discrepancy_amount, pricing_status, partial_expected_amount, identified_finding_amount, review_status, tolerances_applied, calculation_trace)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::review_status, $13, $14) RETURNING id",
     )
     .bind(organization_id)
     .bind(invoice_id)
     .bind(input.applicable_rate.as_ref().map(|r| r.id))
     .bind(input.manifest.as_ref().map(|m| m.id))
     .bind(first_ticket_id)
-    .bind(result.expected_amount.as_decimal())
+    .bind(result.expected_amount.map(|amount| amount.as_decimal()))
     .bind(result.invoiced_amount.as_decimal())
-    .bind(result.discrepancy_amount.as_decimal())
+    .bind(result.discrepancy_amount.map(|amount| amount.as_decimal()))
+    .bind(result.pricing_status.as_db())
+    .bind(result.partial_expected_amount.map(|amount| amount.as_decimal()))
+    .bind(result.identified_finding_amount.as_decimal())
     .bind(result.review_status.as_db())
     .bind(serde_json::to_value(&result.tolerances_applied).map_err(|e| AppError::Internal(e.into()))?)
     .bind(serde_json::to_value(&result.calculation_trace).map_err(|e| AppError::Internal(e.into()))?)

@@ -445,6 +445,119 @@ async fn full_review_evidence_dispute_and_recovery_lifecycle() {
 }
 
 #[tokio::test]
+async fn legacy_reconciliation_hides_unverified_totals_from_detail_apis() {
+    let app = test_app().await;
+    let org = app.signup_org("legacy-pricing-api").await;
+    let (_, _, invoice_id) =
+        setup(&app, &org, "legacy-pricing-api", "10", &[("T", "10")]).await;
+
+    let run = ok(
+        &app,
+        &org,
+        "/api/v1/reconciliations/run",
+        json!({ "invoice_id": invoice_id }),
+    )
+    .await;
+
+    let reconciliation_id = run["reconciliation_id"]
+        .as_str()
+        .expect("reconciliation ID")
+        .to_string();
+
+    let (status, complete) = app
+        .get(
+            &format!("/api/v1/reconciliations/{reconciliation_id}"),
+            &org.token,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{complete}");
+    assert_eq!(complete["pricing_status"], "COMPLETE");
+    assert_eq!(complete["expected_amount"], "4500.0000");
+    assert_eq!(complete["discrepancy_amount"], "700.0000");
+
+    // Simulate a historical reconciliation: change only its verification status.
+    // The stored numeric values must remain intact for audit/history.
+    let reconciliation_uuid = uuid::Uuid::parse_str(&reconciliation_id).unwrap();
+    let invoice_uuid = uuid::Uuid::parse_str(&invoice_id).unwrap();
+
+    let mut tx = xflow_backend::tenants::begin_scoped_tx(
+        &app.pool,
+        org.organization_id,
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE reconciliations \
+         SET pricing_status = 'LEGACY_UNVERIFIED' \
+         WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(reconciliation_uuid)
+    .bind(org.organization_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let stored = sqlx::query_as::<_, (String, String)>(
+        "SELECT expected_amount::text, discrepancy_amount::text \
+         FROM reconciliations \
+         WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(reconciliation_uuid)
+    .bind(org.organization_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+
+    assert_eq!(stored.0, "4500.0000");
+    assert_eq!(stored.1, "700.0000");
+    tx.commit().await.unwrap();
+
+    // Legacy pricing must not contribute historical findings to current dashboard totals.
+    // The invoice remains analyzed, and the pricing-incomplete count must include it.
+    let (dashboard_status, dashboard) = app.get("/api/v1/dashboard", &org.token).await;
+    assert_eq!(dashboard_status, StatusCode::OK, "{dashboard}");
+    assert_eq!(dashboard["invoices_analyzed"], 1, "{dashboard}");
+    assert_eq!(dashboard["pricing_incomplete_count"], 1, "{dashboard}");
+    assert_eq!(dashboard["potential_discrepancy_total"], "0.0000", "{dashboard}");
+    assert_eq!(dashboard["confirmed_discrepancy_total"], "0.0000", "{dashboard}");
+
+    let (status, legacy_detail) = app
+        .get(
+            &format!("/api/v1/reconciliations/{reconciliation_id}"),
+            &org.token,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{legacy_detail}");
+    assert_eq!(legacy_detail["pricing_status"], "LEGACY_UNVERIFIED");
+    assert!(legacy_detail["expected_amount"].is_null(), "{legacy_detail}");
+    assert!(
+        legacy_detail["discrepancy_amount"].is_null(),
+        "{legacy_detail}"
+    );
+
+    let (status, invoice_detail) = app
+        .get(&format!("/api/v1/invoices/{invoice_uuid}"), &org.token)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{invoice_detail}");
+    assert_eq!(
+        invoice_detail["latest_reconciliation"]["pricing_status"],
+        "LEGACY_UNVERIFIED"
+    );
+    assert!(
+        invoice_detail["latest_reconciliation"]["expected_amount"].is_null(),
+        "{invoice_detail}"
+    );
+    assert!(
+        invoice_detail["latest_reconciliation"]["discrepancy_amount"].is_null(),
+        "{invoice_detail}"
+    );
+}
+
+#[tokio::test]
 async fn new_endpoints_are_tenant_isolated_and_reject_foreign_references() {
     let app = test_app().await;
     let a = app.signup_org("iso-a").await;
