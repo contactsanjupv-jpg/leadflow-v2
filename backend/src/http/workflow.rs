@@ -181,11 +181,25 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
                 'unit_price', l.unit_price::text, 'line_total', l.line_total::text) ORDER BY l.id), '[]'::jsonb) FROM invoice_line_items l WHERE l.invoice_id = i.id))
          FROM (SELECT id, invoice_number, invoice_date, service_date, waste_stream, total::text AS total, source_document_id FROM invoices WHERE id = $1) i",
     ).bind(invoice_id).fetch_one(&mut **tx).await?;
+    // Parent rate kept for backward compatibility with existing evidence consumers.
     let rate: Option<Value> = sqlx::query_scalar(
         "SELECT to_jsonb(cr) || jsonb_build_object('authorized_fees', (SELECT coalesce(jsonb_agg(jsonb_build_object('fee_code', f.fee_code, 'description', f.description, 'amount', f.amount::text) ORDER BY f.fee_code), '[]'::jsonb)
                 FROM contract_authorized_fees f WHERE f.contract_rate_id = cr.id), 'contract_name', (SELECT name FROM contracts WHERE id = cr.contract_id), 'contract_source_document_id', (SELECT source_document_id FROM contracts WHERE id = cr.contract_id))
          FROM (SELECT id, contract_id, waste_stream, unit, unit_rate::text AS unit_rate, effective_from, effective_to FROM contract_rates WHERE id = (SELECT contract_rate_id FROM reconciliations WHERE id = $1)) cr",
     ).bind(rec_id).fetch_optional(&mut **tx).await?;
+    // Persisted line-level evidence: the rate that priced each invoice line in THIS reconciliation.
+    let priced_lines: Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.invoice_line_item_id), '[]'::jsonb) FROM (
+           SELECT lr.invoice_line_item_id, l.description, l.quantity::text AS quantity, l.unit AS invoice_unit,
+                  lr.contract_rate_id, cr.contract_id, cr.facility_id, cr.waste_stream, cr.unit AS unit,
+                  cr.unit_rate::text AS unit_rate, cr.effective_from, cr.effective_to,
+                  (SELECT name FROM contracts WHERE id = cr.contract_id) AS contract_name,
+                  lr.expected_line_amount::text AS expected_line_amount
+             FROM reconciliation_line_rates lr
+             JOIN invoice_line_items l ON l.id = lr.invoice_line_item_id
+             JOIN contract_rates cr ON cr.id = lr.contract_rate_id
+            WHERE lr.reconciliation_id = $1) p",
+    ).bind(rec_id).fetch_one(&mut **tx).await?;
     let manifest: Option<Value> = sqlx::query_scalar(
         "SELECT to_jsonb(m) FROM (SELECT id, manifest_number, waste_stream, container_count, quantity::text AS quantity, unit, shipment_date, source_document_id FROM manifests WHERE id = (SELECT manifest_id FROM reconciliations WHERE id = $1)) m",
     ).bind(rec_id).fetch_optional(&mut **tx).await?;
@@ -197,7 +211,8 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
         "SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.created_at), '[]'::jsonb) FROM (SELECT id, document_type::text AS document_type, original_filename, sha256, created_at FROM documents WHERE id IN (
             SELECT source_document_id FROM invoices WHERE id = $1 UNION SELECT source_document_id FROM manifests WHERE id = (SELECT manifest_id FROM reconciliations WHERE id = $2)
             UNION SELECT source_document_id FROM weight_records WHERE manifest_id = (SELECT manifest_id FROM reconciliations WHERE id = $2)
-            UNION SELECT source_document_id FROM contracts WHERE id = (SELECT contract_id FROM contract_rates WHERE id = (SELECT contract_rate_id FROM reconciliations WHERE id = $2)))) d",
+            UNION SELECT source_document_id FROM contracts WHERE id = (SELECT contract_id FROM contract_rates WHERE id = (SELECT contract_rate_id FROM reconciliations WHERE id = $2))
+            UNION SELECT source_document_id FROM contracts WHERE id IN (SELECT cr.contract_id FROM reconciliation_line_rates lr JOIN contract_rates cr ON cr.id = lr.contract_rate_id WHERE lr.reconciliation_id = $2))) d",
     ).bind(invoice_id).bind(rec_id).fetch_one(&mut **tx).await?;
     Ok(json!({
         "format_version": 1,
@@ -205,6 +220,7 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
         "reconciliation": reconciliation,
         "invoice": invoice,
         "contract_rate": rate,
+        "priced_lines": priced_lines,
         "manifest": manifest,
         "weight_tickets": tickets,
         "source_documents": documents,

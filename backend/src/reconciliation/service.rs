@@ -405,14 +405,18 @@ pub async fn run_for_invoice(
     .fetch_all(&mut **tx)
     .await?;
 
-    let reconciliation_id: Uuid = sqlx::query_scalar(
+        let reconciliation_id: Uuid = sqlx::query_scalar(
         "INSERT INTO reconciliations
            (organization_id, invoice_id, contract_rate_id, manifest_id, weight_record_id, expected_amount, invoiced_amount, discrepancy_amount, pricing_status, partial_expected_amount, identified_finding_amount, review_status, tolerances_applied, calculation_trace)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::review_status, $13, $14) RETURNING id",
     )
     .bind(organization_id)
     .bind(invoice_id)
-    .bind(input.applicable_rates.first().map(|r| r.id))
+    .bind(if input.applicable_rates.len() == 1 {
+        input.applicable_rates.first().map(|r| r.id)
+    } else {
+        None
+    })
     .bind(input.manifest.as_ref().map(|m| m.id))
     .bind(first_ticket_id)
     .bind(result.expected_amount.map(|amount| amount.as_decimal()))
@@ -426,6 +430,22 @@ pub async fn run_for_invoice(
     .bind(serde_json::to_value(&result.calculation_trace).map_err(|e| AppError::Internal(e.into()))?)
     .fetch_one(&mut **tx)
     .await?;
+
+    for priced in &result.priced_lines {
+        sqlx::query(
+            "INSERT INTO reconciliation_line_rates
+               (organization_id, reconciliation_id, invoice_id, invoice_line_item_id, contract_rate_id, expected_line_amount)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(organization_id)
+        .bind(reconciliation_id)
+        .bind(input.invoice.id)
+        .bind(priced.invoice_line_item_id)
+        .bind(priced.contract_rate_id)
+        .bind(priced.expected_line_amount.as_decimal())
+        .execute(&mut **tx)
+        .await?;
+    }
 
     let mut discrepancy_ids = Vec::with_capacity(result.discrepancies.len());
     let mut statuses = Vec::with_capacity(result.discrepancies.len());

@@ -14,8 +14,18 @@ export default function InvoiceDetail() {
   async function run() {
     await act.run(() => api("POST", "/reconciliations/run", { invoice_id: id }), "Reconciliation complete");
     await inv.reload();
+    await rec.reload();
   }
   const i = inv.data, r = rec.data;
+  const priced = (r?.priced_lines ?? []) as Array<{
+    invoice_line_item_id: string;
+    contract_rate_id: string;
+    expected_line_amount: string;
+    unit: string;
+    unit_rate: string;
+  }>;
+  const lineById = new Map((i?.lines ?? []).map((l: { id: string }) => [l.id, l]));
+
   return (
     <>
       <h1>Invoice {i?.invoice_number ?? ""}</h1>
@@ -45,6 +55,24 @@ export default function InvoiceDetail() {
               {r.pricing_status === "PARTIAL" && <p className="muted">Partial expected subtotal: <b><Money v={r.partial_expected_amount} /></b>. This is only the amount that could be priced; it is not the full invoice expected amount. The bill-level discrepancy is not computed until the unit mismatch is resolved.</p>}
               {r.pricing_status === "UNCOMPUTABLE" && <p className="muted">No contract rate effective on the service date was available. The expected amount and bill-level discrepancy cannot be computed. Resolve rate coverage and rerun reconciliation.</p>}
               {r.pricing_status === "LEGACY_UNVERIFIED" && <p className="muted">This is a historical reconciliation created before pricing completeness was tracked. Its prior expected amount and bill-level discrepancy are not verified; rerun reconciliation to calculate them under the current rules.</p>}
+              <h2>Priced lines</h2>
+              <table>
+                <thead><tr><th>Line</th><th>Contract unit</th><th className="num">Contract rate</th><th className="num">Expected amount</th></tr></thead>
+                <tbody>
+                  {priced.map((p) => {
+                    const line = lineById.get(p.invoice_line_item_id) as { description?: string; unit?: string } | undefined;
+                    return (
+                      <tr key={p.invoice_line_item_id}>
+                        <td>{line?.description ?? p.invoice_line_item_id}</td>
+                        <td>{p.unit}</td>
+                        <td className="num"><Money v={p.unit_rate} />/{p.unit}</td>
+                        <td className="num"><Money v={p.expected_line_amount} /></td>
+                      </tr>
+                    );
+                  })}
+                  {priced.length === 0 && <tr><td colSpan={4} className="muted">No persisted line-level rates for this reconciliation.</td></tr>}
+                </tbody>
+              </table>
               <table><thead><tr><th>Finding</th><th>Rule</th><th className="num">Amount</th><th>Status</th></tr></thead>
                 <tbody>{r.discrepancies.map((d: any) => <tr key={d.id}><td><Link href="/review">{d.description}</Link></td><td className="muted">{d.rule_id}</td><td className="num"><Money v={d.amount} /></td><td><Badge s={d.review_status} /></td></tr>)}
                   {r.discrepancies.length === 0 && <tr><td colSpan={4} className="muted">No discrepancies found.</td></tr>}</tbody></table>

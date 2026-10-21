@@ -215,9 +215,16 @@ pub async fn run_reconciliation(
 }
 
 const RECONCILIATION_DETAIL_SQL: &str = r#"
-SELECT to_jsonb(r) || jsonb_build_object('discrepancies', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.created_at, d.id), '[]'::jsonb) FROM (
-    SELECT id, discrepancy_type::text AS discrepancy_type, rule_id, description, amount::text AS amount, confidence, review_status::text AS review_status,
-           reviewed_by, reviewed_at, review_notes, created_at FROM discrepancies WHERE reconciliation_id = r.id) d))
+SELECT to_jsonb(r) || jsonb_build_object(
+    'discrepancies', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.created_at, d.id), '[]'::jsonb) FROM (
+        SELECT id, discrepancy_type::text AS discrepancy_type, rule_id, description, amount::text AS amount, confidence, review_status::text AS review_status,
+               reviewed_by, reviewed_at, review_notes, created_at FROM discrepancies WHERE reconciliation_id = r.id) d),
+    'priced_lines', (SELECT coalesce(jsonb_agg(to_jsonb(pl) ORDER BY pl.invoice_line_item_id), '[]'::jsonb) FROM (
+        SELECT lr.invoice_line_item_id, lr.contract_rate_id, lr.expected_line_amount::text AS expected_line_amount,
+               cr.unit, cr.unit_rate::text AS unit_rate
+          FROM reconciliation_line_rates lr
+          JOIN contract_rates cr ON cr.id = lr.contract_rate_id
+         WHERE lr.reconciliation_id = r.id) pl))
 FROM (SELECT id, invoice_id, contract_rate_id, manifest_id, weight_record_id, pricing_status,
              CASE WHEN pricing_status = 'COMPLETE' THEN expected_amount::text ELSE NULL END AS expected_amount,
              invoiced_amount::text AS invoiced_amount,
