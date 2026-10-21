@@ -133,6 +133,16 @@ fn money_eq(v: &Value, expected: &str) {
     assert_eq!(left, right, "money mismatch: {s} vs {expected}");
 }
 
+fn db_error_parts(e: &sqlx::Error) -> (Option<String>, Option<String>) {
+    match e.as_database_error() {
+        Some(d) => (
+            d.code().map(|c| c.to_string()),
+            d.constraint().map(|c| c.to_string()),
+        ),
+        None => (None, None),
+    }
+}
+
 #[tokio::test]
 async fn multi_unit_run_persists_three_line_rates_and_detail_reload_matches() {
     let app = test_app().await;
@@ -601,7 +611,6 @@ async fn cross_tenant_cannot_read_or_write_line_rates() {
         .await;
     let rec_id = Uuid::parse_str(run["reconciliation_id"].as_str().unwrap()).unwrap();
 
-    // Org B scoped session must see zero of Org A's line rates.
     let mut tx = xflow_backend::tenants::begin_scoped_tx(&app.pool, org_b.organization_id)
         .await
         .unwrap();
@@ -614,27 +623,30 @@ async fn cross_tenant_cannot_read_or_write_line_rates() {
     .unwrap();
     assert_eq!(visible, 0, "Org B must not see Org A line rates via RLS");
 
-    // WITH CHECK: Org B cannot insert a row claiming Org A's organization_id.
+    // All NOT NULL columns are supplied, so the only reason to fail is RLS WITH CHECK.
     let res = sqlx::query(
         r#"
         INSERT INTO reconciliation_line_rates
-          (organization_id, reconciliation_id, invoice_line_item_id, contract_rate_id, expected_line_amount)
-        VALUES ($1, $2, $3, $4, 1.0000)
+          (organization_id, reconciliation_id, invoice_id, invoice_line_item_id, contract_rate_id, expected_line_amount)
+        VALUES ($1, $2, $3, $4, $5, 1.0000)
         "#,
     )
     .bind(org_a.organization_id)
     .bind(rec_id)
+    .bind(seed.invoice_id)
     .bind(seed.disposal_line_id)
     .bind(seed.disposal_rate_id)
     .execute(&mut *tx)
     .await;
-    assert!(
-        res.is_err(),
-        "RLS WITH CHECK must reject cross-tenant line-rate inserts"
+    let err = res.expect_err("RLS WITH CHECK must reject cross-tenant line-rate inserts");
+    let (code, _) = db_error_parts(&err);
+    assert_eq!(
+        code.as_deref(),
+        Some("42501"),
+        "expected an RLS violation (42501), got {err:?}"
     );
     tx.rollback().await.unwrap();
 
-    // HTTP: Org B cannot run or load Org A's reconciliation.
     let (status, _) = app
         .post(
             "/api/v1/reconciliations/run",
@@ -645,10 +657,7 @@ async fn cross_tenant_cannot_read_or_write_line_rates() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (status, _) = app
-        .get(
-            &format!("/api/v1/reconciliations/{rec_id}"),
-            &org_b.token,
-        )
+        .get(&format!("/api/v1/reconciliations/{rec_id}"), &org_b.token)
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -713,4 +722,253 @@ async fn evidence_package_priced_lines_match_detail_api() {
         .map(|e| e["contract_rate_id"].as_str().unwrap())
         .collect();
     assert_eq!(rate_ids.len(), 3, "three lines must reference three distinct rates");
+}
+
+#[tokio::test]
+async fn composite_fk_rejects_cross_org_rate_on_line_rate_row() {
+    let app = test_app().await;
+    let org_a = app.signup_org("mu-fk-a").await;
+    let org_b = app.signup_org("mu-fk-b").await;
+    let seed_a = seed_multi_unit(&app, &org_a).await;
+    let seed_b = seed_multi_unit(&app, &org_b).await;
+
+    let (_, run) = app
+        .post(
+            "/api/v1/reconciliations/run",
+            &org_a.token,
+            json!({ "invoice_id": seed_a.invoice_id }),
+        )
+        .await;
+    let rec_a = Uuid::parse_str(run["reconciliation_id"].as_str().unwrap()).unwrap();
+
+    // Org A's own session, so RLS passes; only Org B's rate id is foreign.
+    let mut tx = xflow_backend::tenants::begin_scoped_tx(&app.pool, org_a.organization_id)
+        .await
+        .unwrap();
+    // The run already stored a row for this line; remove it inside this rolled-back
+    // transaction so the primary key does not fire before the foreign key is checked.
+    sqlx::query(
+        "DELETE FROM reconciliation_line_rates WHERE reconciliation_id = $1 AND invoice_line_item_id = $2",
+    )
+    .bind(rec_a)
+    .bind(seed_a.disposal_line_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let res = sqlx::query(
+        r#"
+        INSERT INTO reconciliation_line_rates
+          (organization_id, reconciliation_id, invoice_id, invoice_line_item_id, contract_rate_id, expected_line_amount)
+        VALUES ($1, $2, $3, $4, $5, 99.0000)
+        "#,
+    )
+    .bind(org_a.organization_id)
+    .bind(rec_a)
+    .bind(seed_a.invoice_id)
+    .bind(seed_a.disposal_line_id)
+    .bind(seed_b.disposal_rate_id)
+    .execute(&mut *tx)
+    .await;
+    let err = res.expect_err("composite FK must reject another organization's rate");
+    let (code, constraint) = db_error_parts(&err);
+    assert_eq!(code.as_deref(), Some("23503"), "{err:?}");
+    assert_eq!(
+        constraint.as_deref(),
+        Some("reconciliation_line_rates_rate_same_org"),
+        "{err:?}"
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn composite_fk_rejects_cross_invoice_line_and_reconciliation() {
+    let app = test_app().await;
+    let org = app.signup_org("mu-xinv").await;
+    let seed = seed_multi_unit(&app, &org).await;
+    let org_id = org.organization_id;
+
+    let (_, run) = app
+        .post(
+            "/api/v1/reconciliations/run",
+            &org.token,
+            json!({ "invoice_id": seed.invoice_id }),
+        )
+        .await;
+    let rec_id = Uuid::parse_str(run["reconciliation_id"].as_str().unwrap()).unwrap();
+
+    // A second invoice with one line in the SAME organization.
+    let vendor2 = Uuid::new_v4();
+    let invoice2 = Uuid::new_v4();
+    let line2 = Uuid::new_v4();
+    let mut tx = xflow_backend::tenants::begin_scoped_tx(&app.pool, org_id)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO vendors (id, organization_id, name) VALUES ($1, $2, 'Other Vendor')")
+        .bind(vendor2)
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO invoices
+          (id, organization_id, vendor_id, invoice_number, invoice_date, service_date, waste_stream, total)
+        VALUES ($1, $2, $3, 'XINV-2', '2026-03-15', '2026-03-10', 'F003', 100.0000)
+        "#,
+    )
+    .bind(invoice2)
+    .bind(org_id)
+    .bind(vendor2)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO invoice_line_items
+          (id, invoice_id, organization_id, description, quantity, unit, unit_price, line_total)
+        VALUES ($1, $2, $3, 'Other line', 1, 'ton', 100.0000, 100.0000)
+        "#,
+    )
+    .bind(line2)
+    .bind(invoice2)
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let insert_sql = r#"
+        INSERT INTO reconciliation_line_rates
+          (organization_id, reconciliation_id, invoice_id, invoice_line_item_id, contract_rate_id, expected_line_amount)
+        VALUES ($1, $2, $3, $4, $5, 1.0000)
+        "#;
+
+    // Case 1: reconciliation of invoice 1, but the line belongs to invoice 2.
+    let mut tx = xflow_backend::tenants::begin_scoped_tx(&app.pool, org_id)
+        .await
+        .unwrap();
+    let err = sqlx::query(insert_sql)
+        .bind(org_id)
+        .bind(rec_id)
+        .bind(seed.invoice_id)
+        .bind(line2)
+        .bind(seed.disposal_rate_id)
+        .execute(&mut *tx)
+        .await
+        .expect_err("a line from another invoice must be rejected");
+    let (code, constraint) = db_error_parts(&err);
+    assert_eq!(code.as_deref(), Some("23503"), "{err:?}");
+    assert_eq!(
+        constraint.as_deref(),
+        Some("reconciliation_line_rates_line_same_invoice"),
+        "{err:?}"
+    );
+    tx.rollback().await.unwrap();
+
+    // Case 2: the line matches invoice 2, but the reconciliation belongs to invoice 1.
+    let mut tx = xflow_backend::tenants::begin_scoped_tx(&app.pool, org_id)
+        .await
+        .unwrap();
+    let err = sqlx::query(insert_sql)
+        .bind(org_id)
+        .bind(rec_id)
+        .bind(invoice2)
+        .bind(line2)
+        .bind(seed.disposal_rate_id)
+        .execute(&mut *tx)
+        .await
+        .expect_err("a reconciliation of another invoice must be rejected");
+    let (code, constraint) = db_error_parts(&err);
+    assert_eq!(code.as_deref(), Some("23503"), "{err:?}");
+    assert_eq!(
+        constraint.as_deref(),
+        Some("reconciliation_line_rates_reconciliation_same_scope"),
+        "{err:?}"
+    );
+    tx.rollback().await.unwrap();
+}
+#[tokio::test]
+#[ignore = "needs MIGRATION_DATABASE_URL (superuser) to install a temporary failure trigger"]
+async fn failed_line_insert_rolls_back_reconciliation_and_discrepancies() {
+    let admin_url = std::env::var("MIGRATION_DATABASE_URL")
+        .expect("set MIGRATION_DATABASE_URL to a superuser URL to run this test");
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("connect as superuser");
+
+    let app = test_app().await;
+    let org = app.signup_org("mu-rollback").await;
+    let seed = seed_multi_unit(&app, &org).await;
+    let org_id = org.organization_id;
+
+    // Temporary failure, scoped to this invoice only so parallel tests are unaffected.
+    let name = format!("fail_lr_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN RAISE EXCEPTION 'forced line-rate failure'; END $body$"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER {name} BEFORE INSERT ON reconciliation_line_rates FOR EACH ROW WHEN (NEW.invoice_id = '{}') EXECUTE FUNCTION {name}()",
+        seed.invoice_id
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let (status, body) = app
+        .post(
+            "/api/v1/reconciliations/run",
+            &org.token,
+            json!({ "invoice_id": seed.invoice_id }),
+        )
+        .await;
+
+    // Inspect state while the failure is still installed.
+    let mut tx = xflow_backend::tenants::begin_scoped_tx(&app.pool, org_id)
+        .await
+        .unwrap();
+    let recs: i64 = sqlx::query_scalar("SELECT count(*) FROM reconciliations WHERE invoice_id = $1")
+        .bind(seed.invoice_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let discs: i64 = sqlx::query_scalar("SELECT count(*) FROM discrepancies")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let lines: i64 = sqlx::query_scalar("SELECT count(*) FROM reconciliation_line_rates")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+
+    // Always clean up the temporary trigger before asserting.
+    sqlx::query(&format!("DROP TRIGGER {name} ON reconciliation_line_rates"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP FUNCTION {name}()"))
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(recs, 0, "failed run must not leave a reconciliation row");
+    assert_eq!(discs, 0, "failed run must not leave discrepancy rows");
+    assert_eq!(lines, 0, "failed run must not leave line-rate rows");
+
+    // With the failure removed, the same invoice reconciles normally.
+    let (status, run) = app
+        .post(
+            "/api/v1/reconciliations/run",
+            &org.token,
+            json!({ "invoice_id": seed.invoice_id }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["priced_lines"].as_array().map(|a| a.len()), Some(3));
 }
