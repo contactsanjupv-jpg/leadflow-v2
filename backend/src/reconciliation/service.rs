@@ -90,11 +90,24 @@ async fn load_rate(
 ) -> Result<ContractRate, AppError> {
     let (id, vendor_id, facility_id, waste_stream, unit, unit_rate, effective_from, effective_to) =
         row;
-    let fees: Vec<(String, Option<String>, Decimal)> =
-        sqlx::query_as("SELECT fee_code, description, amount FROM contract_authorized_fees WHERE contract_rate_id = $1 ORDER BY fee_code")
+    let fees: Vec<(String, Option<String>, Decimal, Option<String>)> =
+        sqlx::query_as("SELECT fee_code, description, amount, charge_type FROM contract_authorized_fees WHERE contract_rate_id = $1 ORDER BY fee_code")
             .bind(id)
             .fetch_all(&mut **tx)
             .await?;
+    let authorized_fees = fees
+        .into_iter()
+        .map(
+            |(fee_code, description, amount, charge_type)| -> Result<AuthorizedFee, AppError> {
+            Ok(AuthorizedFee {
+                charge_type: parse_charge_type(&fee_code, charge_type.as_deref())?,
+                fee_code,
+                description: description.unwrap_or_default(),
+                amount: Money::from_decimal(amount),
+            })
+            },
+        )
+        .collect::<Result<Vec<_>, AppError>>()?;
     Ok(ContractRate {
         id,
         vendor_id,
@@ -104,15 +117,27 @@ async fn load_rate(
         effective_from,
         effective_to,
         unit_rate: Money::from_decimal(unit_rate),
-        authorized_fees: fees
-            .into_iter()
-            .map(|(fee_code, description, amount)| AuthorizedFee {
-                fee_code,
-                description: description.unwrap_or_default(),
-                amount: Money::from_decimal(amount),
-            })
-            .collect(),
+        authorized_fees,
     })
+}
+
+/// Map a stored `charge_type` to the domain type. SQL NULL is an unclassified legacy fee. `EXACT` and
+/// `CAP` map to their variants. Any other non-NULL value is a data error; it is never treated as
+/// unclassified, because that would hide corrupt contract data behind a review finding.
+fn parse_charge_type(
+    fee_code: &str,
+    stored: Option<&str>,
+) -> Result<Option<FeeChargeType>, AppError> {
+    match stored {
+        None => Ok(None),
+        Some(label) => FeeChargeType::from_db(label).map(Some).ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!(
+                "authorized fee '{}' has unrecognised charge_type '{}'",
+                fee_code,
+                label
+            ))
+        }),
+    }
 }
 
 /// Run (or re-run) the reconciliation for one invoice inside an already tenant-scoped transaction.
@@ -526,4 +551,39 @@ pub async fn refresh_reconciliation_status(
         .execute(&mut **tx)
         .await?;
     Ok(rolled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_null_charge_type_is_an_unclassified_fee() {
+        assert!(matches!(parse_charge_type("TRANSPORT", None), Ok(None)));
+    }
+
+    #[test]
+    fn exact_and_cap_map_to_their_variants() {
+        assert!(matches!(
+            parse_charge_type("TRANSPORT", Some("EXACT")),
+            Ok(Some(FeeChargeType::Exact))
+        ));
+        assert!(matches!(
+            parse_charge_type("TRANSPORT", Some("CAP")),
+            Ok(Some(FeeChargeType::Cap))
+        ));
+    }
+
+    #[test]
+    fn unknown_non_null_charge_type_is_a_data_error_not_unclassified() {
+        for bad in ["", "exact", "cap", "MAX", "FIXED", "NULL", " EXACT"] {
+            assert!(
+                matches!(
+                    parse_charge_type("TRANSPORT", Some(bad)),
+                    Err(AppError::Internal(_))
+                ),
+                "{bad:?} must be rejected, not treated as unclassified"
+            );
+        }
+    }
 }

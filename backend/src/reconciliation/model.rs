@@ -6,11 +6,43 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Whether an authorized fee `amount` is an exact fixed charge or a maximum cap.
+/// A fee with no type (`None` on `AuthorizedFee`) is an unclassified legacy fee: it is never
+/// inferred as either and must be reported for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum FeeChargeType {
+    Exact,
+    Cap,
+}
+
+impl FeeChargeType {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            FeeChargeType::Exact => "EXACT",
+            FeeChargeType::Cap => "CAP",
+        }
+    }
+
+    /// Returns `None` for anything other than the two stored labels. Callers must keep SQL `NULL`
+    /// (unclassified) distinct from an unrecognised value; the latter is a data error, not a type.
+    pub fn from_db(s: &str) -> Option<FeeChargeType> {
+        match s {
+            "EXACT" => Some(FeeChargeType::Exact),
+            "CAP" => Some(FeeChargeType::Cap),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorizedFee {
     pub fee_code: String,
     pub description: String,
     pub amount: Money,
+    /// `None` = unclassified legacy fee. Never inferred as `Exact` or `Cap`.
+    #[serde(default)]
+    pub charge_type: Option<FeeChargeType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +375,41 @@ mod db_mapping_tests {
             assert_eq!(status.as_db(), expected);
             assert_eq!(serde_json::to_string(&status).unwrap(), format!("\"{expected}\""));
         }
+    }
+
+    #[test]
+    fn fee_charge_type_uses_stable_database_and_wire_labels() {
+        for (kind, expected) in [
+            (FeeChargeType::Exact, "EXACT"),
+            (FeeChargeType::Cap, "CAP"),
+        ] {
+            assert_eq!(kind.as_db(), expected);
+            assert_eq!(FeeChargeType::from_db(expected), Some(kind));
+            assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{expected}\""));
+        }
+    }
+
+    #[test]
+    fn fee_charge_type_is_never_inferred_from_unknown_or_lowercase_labels() {
+        for bad in ["", "exact", "cap", "Exact", "MAX", "FIXED", "NULL"] {
+            assert_eq!(FeeChargeType::from_db(bad), None, "{bad:?} must not map to a type");
+        }
+        assert!(serde_json::from_str::<FeeChargeType>("\"cap\"").is_err());
+    }
+
+    #[test]
+    fn authorized_fee_without_a_type_deserializes_as_unclassified() {
+        let fee: AuthorizedFee = serde_json::from_str(
+            r#"{"fee_code":"TRANSPORT","description":"Transportation","amount":"500.0000"}"#,
+        )
+        .unwrap();
+        assert_eq!(fee.charge_type, None);
+
+        let typed: AuthorizedFee = serde_json::from_str(
+            r#"{"fee_code":"TRANSPORT","description":"","amount":"500.0000","charge_type":"CAP"}"#,
+        )
+        .unwrap();
+        assert_eq!(typed.charge_type, Some(FeeChargeType::Cap));
     }
 
     #[test]

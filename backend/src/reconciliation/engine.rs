@@ -4,6 +4,9 @@ use crate::common::money::Money;
 use crate::reconciliation::model::*;
 use crate::reconciliation::rules;
 
+/// COMPLETE pricing whose bill-level gap the findings do not explain (beyond entry rounding).
+const RULE_UNRECONCILED_TOTAL: &str = "RULE_13_UNRECONCILED_BILL_TOTAL";
+
 pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
     let mut discrepancies: Vec<DiscrepancyLine> = Vec::new();
     let mut trace: Vec<String> = Vec::new();
@@ -147,98 +150,82 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
             }
             let Some(fee_code) = &line.fee_code else { continue };
 
-            let auth_amounts: Vec<Money> = applicable_rates
-                .iter()
-                .flat_map(|r| r.authorized_fees.iter())
-                .filter(|f| f.fee_code.trim().eq_ignore_ascii_case(fee_code.trim()))
-                .map(|f| f.amount)
-                .collect();
+            // One shared evaluator decides EXACT / CAP / unclassified / conflicting outcomes.
+            let options = rules::authorized_fee_options(&applicable_rates, fee_code);
+            let evaluation = rules::evaluate_authorized_fee(&options, line.line_total);
 
-            let mut distinct = Vec::new();
-            for a in &auth_amounts {
-                if !distinct.contains(a) {
-                    distinct.push(*a);
-                }
-            }
-
-            match distinct.as_slice() {
-                [amount] => {
-                    expected = expected + *amount;
+            match evaluation {
+                rules::FeeEvaluation::Priced {
+                    charge_type,
+                    authorized,
+                    expected: fee_expected,
+                    ..
+                } => {
+                    expected = expected + fee_expected;
                     if let Some(rate) = applicable_rates.iter().find(|r| {
                         r.authorized_fees.iter().any(|f| {
-                            f.fee_code.trim().eq_ignore_ascii_case(fee_code.trim())
-                                && f.amount == *amount
+                            rules::fee_codes_match(&f.fee_code, fee_code)
+                                && f.amount == authorized
+                                && f.charge_type == Some(charge_type)
                         })
                     }) {
                         priced_lines.push(PricedInvoiceLine {
                             invoice_line_item_id: line.id,
                             contract_rate_id: rate.id,
-                            expected_line_amount: *amount,
+                            expected_line_amount: fee_expected,
                         });
                     }
-                    trace.push(format!(
-                        "Expected authorized fee '{}': {}",
-                        fee_code, amount
-                    ));
-                    if *amount != line.line_total {
-                        let diff = line.line_total - *amount;
-                        let d = DiscrepancyLine {
-                            discrepancy_type: DiscrepancyType::UnauthorizedFee,
-                            description: format!(
-                                "Fee '{}' billed at {} but authorized amount is {}",
-                                fee_code, line.line_total, amount
-                            ),
-                            amount: diff,
-                            rule_id: rules::RULE_UNAUTHORIZED_FEE.to_string(),
-                            confidence: Confidence::High,
-                        };
-                        trace.push(format!(
-                            "RULE {}: {} (amount: {})",
-                            d.rule_id, d.description, d.amount
-                        ));
-                        discrepancies.push(d);
+                    match charge_type {
+                        FeeChargeType::Exact => trace.push(format!(
+                            "Expected authorized fee '{}': {}",
+                            fee_code, fee_expected
+                        )),
+                        FeeChargeType::Cap => trace.push(format!(
+                            "Expected authorized fee '{}' (cap {}): {}",
+                            fee_code, authorized, fee_expected
+                        )),
                     }
                 }
-                [] => {
-                    let d = DiscrepancyLine {
-                        discrepancy_type: DiscrepancyType::UnauthorizedFee,
-                        description: format!(
-                            "Fee '{}' ({}) billed but not found in contracted authorized fees",
-                            fee_code, line.description
-                        ),
-                        amount: line.line_total,
-                        rule_id: rules::RULE_UNAUTHORIZED_FEE.to_string(),
-                        confidence: Confidence::High,
-                    };
+                rules::FeeEvaluation::NotAuthorized => {}
+                rules::FeeEvaluation::Conflicting { amounts_differ } => {
+                    unpriced_fee += 1;
+                    trace.push(if amounts_differ {
+                        format!(
+                            "Fee '{}' has conflicting authorized amounts across applicable rates",
+                            fee_code
+                        )
+                    } else {
+                        format!(
+                            "Fee '{}' has conflicting charge types across applicable rates",
+                            fee_code
+                        )
+                    });
+                }
+                rules::FeeEvaluation::Unclassified { authorized } => {
+                    unpriced_fee += 1;
+                    trace.push(format!(
+                        "Fee '{}' is authorized at {} but its charge type (exact or cap) is not set; expected amount cannot be determined",
+                        fee_code, authorized
+                    ));
+                }
+            }
+
+            if let Some(d) =
+                rules::fee_finding(fee_code, &line.description, line.line_total, &evaluation)
+            {
+                if !evaluation.is_unresolved() {
                     trace.push(format!(
                         "RULE {}: {} (amount: {})",
                         d.rule_id, d.description, d.amount
                     ));
-                    discrepancies.push(d);
                 }
-                _ => {
-                    unpriced_fee += 1;
-                    trace.push(format!(
-                        "Fee '{}' has conflicting authorized amounts across applicable rates",
-                        fee_code
-                    ));
-                    discrepancies.push(DiscrepancyLine {
-                        discrepancy_type: DiscrepancyType::Other,
-                        description: format!(
-                            "Fee '{}' is authorized at conflicting amounts by multiple rates; expected amount is ambiguous",
-                            fee_code
-                        ),
-                        amount: Money::zero(),
-                        rule_id: "RULE_11_AMBIGUOUS_FEE".to_string(),
-                        confidence: Confidence::High,
-                    });
-                }
+                discrepancies.push(d);
             }
         }
     }
 
     // ---- Pricing status ----
-    let (pricing_status, expected_amount, partial_expected_amount) =
+    let (mut pricing_status, mut expected_amount, mut partial_expected_amount) =
         if applicable_rates.is_empty() {
             // No covering rate at all.
             if let Some(stale) = stale_rates.first() {
@@ -365,6 +352,40 @@ pub fn run(input: &ReconciliationInput) -> ReconciliationResult {
         .iter()
         .fold(Money::zero(), |acc, d| acc + d.amount);
     let invoiced_amount = input.invoice.total;
+
+    // A COMPLETE result must reconcile at bill level: invoiced - expected equals the sum of findings.
+    // Invoice entry allows one cent of rounding per line (quantity x unit price vs line total) and one
+    // cent between the invoice total and its lines, so that is the most a legitimate invoice can leave
+    // unexplained. Anything larger is materially inconsistent and must not be reported as COMPLETE.
+    if pricing_status == PricingStatus::Complete {
+        if let Some(exp) = expected_amount {
+            let allowance = Money::from_decimal(
+                rust_decimal::Decimal::new(1, 2)
+                    * rust_decimal::Decimal::from(input.invoice.line_items.len() as i64 + 1),
+            );
+            let unexplained = (invoiced_amount - exp) - identified_finding_amount;
+            if unexplained > allowance || unexplained < Money::zero() - allowance {
+                trace.push(format!(
+                    "Pricing is PARTIAL: invoiced {} less expected {} leaves {} unexplained by the findings ({}), more than the {} rounding allowance",
+                    invoiced_amount, exp, unexplained, identified_finding_amount, allowance
+                ));
+                discrepancies.push(DiscrepancyLine {
+                    discrepancy_type: DiscrepancyType::Other,
+                    description: format!(
+                        "Invoice total {} differs from the priced expected amount {} by an amount the findings do not explain ({}); the bill-level discrepancy cannot be reported as complete",
+                        invoiced_amount, exp, unexplained
+                    ),
+                    amount: Money::zero(),
+                    rule_id: RULE_UNRECONCILED_TOTAL.to_string(),
+                    confidence: Confidence::High,
+                });
+                pricing_status = PricingStatus::Partial;
+                partial_expected_amount = Some(exp);
+                expected_amount = None;
+            }
+        }
+    }
+
     let expected_display = expected_amount
         .map(|a| a.to_string())
         .unwrap_or_else(|| "not computable".to_string());
@@ -420,6 +441,7 @@ mod tests {
                 fee_code: "TRANSPORT".into(),
                 description: "Transportation".into(),
                 amount: Money::from_str_exact("500.00").unwrap(),
+                charge_type: Some(FeeChargeType::Exact),
             }],
             effective_from: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             effective_to: None,
@@ -981,5 +1003,227 @@ mod tests {
             .iter()
             .any(|l| l.contains("cannot be computed") && l.contains("manual review")));
         assert_eq!(r.review_status, ReviewStatus::New);
+    }
+
+    // ---- authorized-fee semantics through the production engine ----------------------------
+
+    fn usd(n: i64) -> Money {
+        Money::from_decimal(Decimal::from(n))
+    }
+
+    /// Disposal priced exactly at the contract rate ($4,000) plus one TRANSPORT fee line billed at
+    /// `billed`, against a single TRANSPORT authorization of $500 with the given charge type.
+    fn fee_case_input(charge_type: Option<FeeChargeType>, billed: i64) -> ReconciliationInput {
+        let mut input = build_input();
+        input.applicable_rates[0].authorized_fees[0].charge_type = charge_type;
+        input.invoice.line_items.truncate(2);
+        input.invoice.line_items[0].unit_price = Money::from_str_exact("400.00").unwrap();
+        input.invoice.line_items[0].line_total = Money::from_str_exact("4000.00").unwrap();
+        input.invoice.line_items[1].unit_price = usd(billed);
+        input.invoice.line_items[1].line_total = usd(billed);
+        input.invoice.total = usd(4000) + usd(billed);
+        input
+    }
+
+    fn fee_case(charge_type: Option<FeeChargeType>, billed: i64) -> ReconciliationResult {
+        run(&fee_case_input(charge_type, billed))
+    }
+
+    /// For a COMPLETE result: invoiced - expected equals the signed sum of findings, and the
+    /// reported discrepancy is that sum.
+    fn assert_bill_level_invariant(r: &ReconciliationResult) {
+        if r.pricing_status == PricingStatus::Complete {
+            let expected = r.expected_amount.expect("COMPLETE has an expected amount");
+            assert_eq!(r.invoiced_amount - expected, r.identified_finding_amount);
+            assert_eq!(r.discrepancy_amount, Some(r.identified_finding_amount));
+        }
+    }
+
+    #[test]
+    fn exact_fee_below_equal_and_above_authorized_amount() {
+        for (billed, finding) in [(400, Some(-100)), (500, None), (600, Some(100))] {
+            let r = fee_case(Some(FeeChargeType::Exact), billed);
+            assert_eq!(r.pricing_status, PricingStatus::Complete, "billed {billed}");
+            assert_eq!(r.expected_amount, Some(usd(4500)), "billed {billed}");
+            let fee_findings: Vec<_> = r
+                .discrepancies
+                .iter()
+                .filter(|d| d.rule_id == rules::RULE_UNAUTHORIZED_FEE)
+                .collect();
+            match finding {
+                None => assert!(fee_findings.is_empty(), "billed {billed}"),
+                Some(amount) => {
+                    assert_eq!(fee_findings.len(), 1, "billed {billed}");
+                    assert_eq!(fee_findings[0].amount, usd(amount));
+                }
+            }
+            assert_bill_level_invariant(&r);
+        }
+    }
+
+    #[test]
+    fn exact_fee_finding_text_is_unchanged_so_review_decisions_carry_forward() {
+        let r = fee_case(Some(FeeChargeType::Exact), 600);
+        let d = r
+            .discrepancies
+            .iter()
+            .find(|d| d.rule_id == rules::RULE_UNAUTHORIZED_FEE)
+            .unwrap();
+        assert_eq!(
+            d.description,
+            "Fee 'TRANSPORT' billed at $600.00 but authorized amount is $500.00"
+        );
+        assert_eq!(d.amount, usd(100));
+        assert!(r
+            .calculation_trace
+            .iter()
+            .any(|l| l == "Expected authorized fee 'TRANSPORT': $500.00"));
+    }
+
+    #[test]
+    fn cap_fee_below_equal_and_above_the_cap() {
+        // (billed, expected total, finding)
+        for (billed, expected, finding) in [
+            (400, 4400, None),
+            (500, 4500, None),
+            (600, 4500, Some(100)),
+        ] {
+            let r = fee_case(Some(FeeChargeType::Cap), billed);
+            assert_eq!(r.pricing_status, PricingStatus::Complete, "billed {billed}");
+            assert_eq!(r.expected_amount, Some(usd(expected)), "billed {billed}");
+            let fee_findings: Vec<_> = r
+                .discrepancies
+                .iter()
+                .filter(|d| d.rule_id == rules::RULE_UNAUTHORIZED_FEE)
+                .collect();
+            match finding {
+                None => assert!(fee_findings.is_empty(), "billed {billed}"),
+                Some(amount) => {
+                    assert_eq!(fee_findings.len(), 1, "billed {billed}");
+                    assert_eq!(fee_findings[0].amount, usd(amount));
+                    assert_eq!(
+                        fee_findings[0].description,
+                        "Fee 'TRANSPORT' billed at $600.00 exceeds the authorized cap of $500.00"
+                    );
+                }
+            }
+            assert_bill_level_invariant(&r);
+        }
+    }
+
+    #[test]
+    fn cap_fee_below_cap_records_the_billed_amount_as_the_priced_line() {
+        let input = fee_case_input(Some(FeeChargeType::Cap), 400);
+        let fee_line_id = input.invoice.line_items[1].id;
+        let r = run(&input);
+        let priced = r
+            .priced_lines
+            .iter()
+            .find(|p| p.invoice_line_item_id == fee_line_id)
+            .expect("the fee line is priced");
+        assert_eq!(priced.expected_line_amount, usd(400));
+        assert_eq!(r.priced_lines.len(), 2);
+        assert!(r
+            .calculation_trace
+            .iter()
+            .any(|l| l == "Expected authorized fee 'TRANSPORT' (cap $500.00): $400.00"));
+    }
+
+    #[test]
+    fn credits_follow_one_sign_convention_for_exact_and_cap() {
+        let exact = fee_case(Some(FeeChargeType::Exact), -500);
+        assert_eq!(exact.pricing_status, PricingStatus::Complete);
+        assert_eq!(exact.expected_amount, Some(usd(4500)));
+        assert_eq!(exact.identified_finding_amount, usd(-1000));
+        assert_bill_level_invariant(&exact);
+
+        let cap = fee_case(Some(FeeChargeType::Cap), -50);
+        assert_eq!(cap.pricing_status, PricingStatus::Complete);
+        assert_eq!(cap.expected_amount, Some(usd(3950)));
+        assert_eq!(cap.identified_finding_amount, Money::zero());
+        assert_bill_level_invariant(&cap);
+    }
+
+    #[test]
+    fn unclassified_fee_is_never_priced_and_makes_pricing_partial() {
+        for billed in [400, 500, 600] {
+            let r = fee_case(None, billed);
+            assert_eq!(r.pricing_status, PricingStatus::Partial, "billed {billed}");
+            assert_eq!(r.expected_amount, None);
+            assert_eq!(r.discrepancy_amount, None);
+            // Only the disposal line is priced; the unclassified fee contributes nothing.
+            assert_eq!(r.partial_expected_amount, Some(usd(4000)));
+            assert_eq!(r.priced_lines.len(), 1);
+            let flagged: Vec<_> = r
+                .discrepancies
+                .iter()
+                .filter(|d| d.rule_id == rules::RULE_UNCLASSIFIED_FEE)
+                .collect();
+            assert_eq!(flagged.len(), 1);
+            assert_eq!(flagged[0].amount, Money::zero());
+            assert!(r
+                .discrepancies
+                .iter()
+                .all(|d| d.rule_id != rules::RULE_UNAUTHORIZED_FEE));
+        }
+    }
+
+    #[test]
+    fn conflicting_fee_types_across_rates_are_unresolved() {
+        let mut input = fee_case_input(Some(FeeChargeType::Exact), 500);
+        let mut second = input.applicable_rates[0].clone();
+        second.id = Uuid::new_v4();
+        second.unit = "ton".into();
+        second.authorized_fees[0].charge_type = Some(FeeChargeType::Cap);
+        input.applicable_rates.push(second);
+        let r = run(&input);
+        assert_eq!(r.pricing_status, PricingStatus::Partial);
+        assert_eq!(r.expected_amount, None);
+        let flagged: Vec<_> = r
+            .discrepancies
+            .iter()
+            .filter(|d| d.rule_id == rules::RULE_AMBIGUOUS_FEE)
+            .collect();
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].amount, Money::zero());
+    }
+
+    #[test]
+    fn identical_authorizations_from_several_rates_are_not_a_conflict() {
+        let mut input = fee_case_input(Some(FeeChargeType::Cap), 400);
+        let mut second = input.applicable_rates[0].clone();
+        second.id = Uuid::new_v4();
+        second.unit = "ton".into();
+        input.applicable_rates.push(second);
+        let r = run(&input);
+        assert_eq!(r.pricing_status, PricingStatus::Complete);
+        assert_eq!(r.expected_amount, Some(usd(4400)));
+        assert_bill_level_invariant(&r);
+    }
+
+    #[test]
+    fn complete_results_allow_only_entry_rounding_between_total_and_lines() {
+        // One cent between the invoice total and its lines is within what invoice entry allows.
+        let mut input = fee_case_input(Some(FeeChargeType::Exact), 500);
+        input.invoice.total = input.invoice.total + Money::from_str_exact("0.01").unwrap();
+        let r = run(&input);
+        assert_eq!(r.pricing_status, PricingStatus::Complete);
+        assert_eq!(r.discrepancy_amount, Some(Money::zero()));
+        let gap = r.invoiced_amount - r.expected_amount.unwrap();
+        assert_eq!(gap, Money::from_str_exact("0.01").unwrap());
+
+        // A materially inconsistent total is never reported as COMPLETE.
+        let mut input = fee_case_input(Some(FeeChargeType::Exact), 500);
+        input.invoice.total = input.invoice.total + usd(5);
+        let r = run(&input);
+        assert_eq!(r.pricing_status, PricingStatus::Partial);
+        assert_eq!(r.expected_amount, None);
+        assert_eq!(r.discrepancy_amount, None);
+        assert_eq!(r.partial_expected_amount, Some(usd(4500)));
+        assert!(r
+            .discrepancies
+            .iter()
+            .any(|d| d.rule_id == RULE_UNRECONCILED_TOTAL && d.amount == Money::zero()));
+        assert_eq!(r.identified_finding_amount, Money::zero());
     }
 }

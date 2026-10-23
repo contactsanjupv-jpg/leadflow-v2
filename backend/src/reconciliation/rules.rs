@@ -15,45 +15,219 @@ pub const RULE_MISSING_SUPPORT: &str = "RULE_07_MISSING_SUPPORT";
 pub const RULE_DUPLICATE_CHARGE: &str = "RULE_05_DUPLICATE_CHARGE";
 pub const RULE_WASTE_STREAM_MISMATCH: &str = "RULE_08_WASTE_STREAM_MISMATCH";
 pub const RULE_UNIT_MISMATCH: &str = "RULE_10_UNIT_MISMATCH";
+/// A fee several applicable rates authorize inconsistently (differing amounts or charge types).
+pub const RULE_AMBIGUOUS_FEE: &str = "RULE_11_AMBIGUOUS_FEE";
+/// A fee whose authorized amount has no explicit EXACT/CAP type. The type is never inferred.
+pub const RULE_UNCLASSIFIED_FEE: &str = "RULE_12_UNCLASSIFIED_FEE_TYPE";
+
+// ---- Authorized fees: the single authoritative evaluation ----------------------------------
+//
+// Every production and legacy path decides fee outcomes here. Finding amounts are signed
+// `billed - expected`: positive = overbilled, negative = underbilled. For a fee that is priced,
+// `billed - expected` equals the finding amount (or zero when there is no finding), so bill-level
+// expected totals and findings cannot drift apart.
+
+/// One authorization of a fee code by an applicable contract rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedFeeOption {
+    pub amount: Money,
+    pub charge_type: Option<FeeChargeType>,
+}
+
+/// Outcome of evaluating one billed fee line against the applicable authorizations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeEvaluation {
+    /// No applicable rate authorizes this fee code.
+    NotAuthorized,
+    /// Applicable rates authorize the code inconsistently; the expected amount is ambiguous.
+    Conflicting { amounts_differ: bool },
+    /// Exactly one authorization exists but its type is unset. It is never inferred as EXACT or CAP,
+    /// so no expected amount is produced.
+    Unclassified { authorized: Money },
+    /// The fee is priced. `expected` is what the bill-level expected total includes for this line;
+    /// `finding_amount` is the signed amount to report, or `None` when nothing is flagged.
+    Priced {
+        charge_type: FeeChargeType,
+        authorized: Money,
+        expected: Money,
+        finding_amount: Option<Money>,
+    },
+}
+
+impl FeeEvaluation {
+    /// True when no expected amount can be determined, so pricing must not be reported as complete.
+    pub fn is_unresolved(&self) -> bool {
+        matches!(
+            self,
+            FeeEvaluation::Conflicting { .. } | FeeEvaluation::Unclassified { .. }
+        )
+    }
+}
+
+/// Fee codes are compared without regard to surrounding whitespace or ASCII case.
+pub fn fee_codes_match(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// All authorizations of `fee_code` across the applicable rates.
+pub fn authorized_fee_options(rates: &[&ContractRate], fee_code: &str) -> Vec<AuthorizedFeeOption> {
+    rates
+        .iter()
+        .flat_map(|rate| rate.authorized_fees.iter())
+        .filter(|fee| fee_codes_match(&fee.fee_code, fee_code))
+        .map(|fee| AuthorizedFeeOption {
+            amount: fee.amount,
+            charge_type: fee.charge_type,
+        })
+        .collect()
+}
+
+/// Evaluate one billed fee line. Identical (amount, type) authorizations from several rates count
+/// once; any difference in amount or type is a conflict.
+///
+/// * EXACT: expected = authorized amount; any difference is flagged as `billed - authorized`.
+/// * CAP: expected = `min(billed, cap)`; only the amount above the cap is flagged.
+/// * Unset type: unresolved; never treated as EXACT or CAP.
+pub fn evaluate_authorized_fee(options: &[AuthorizedFeeOption], billed: Money) -> FeeEvaluation {
+    let mut distinct: Vec<AuthorizedFeeOption> = Vec::new();
+    for option in options {
+        if !distinct.contains(option) {
+            distinct.push(*option);
+        }
+    }
+
+    match distinct.as_slice() {
+        [] => FeeEvaluation::NotAuthorized,
+        [only] => match only.charge_type {
+            None => FeeEvaluation::Unclassified {
+                authorized: only.amount,
+            },
+            Some(FeeChargeType::Exact) => FeeEvaluation::Priced {
+                charge_type: FeeChargeType::Exact,
+                authorized: only.amount,
+                expected: only.amount,
+                finding_amount: if billed != only.amount {
+                    Some(billed - only.amount)
+                } else {
+                    None
+                },
+            },
+            Some(FeeChargeType::Cap) => FeeEvaluation::Priced {
+                charge_type: FeeChargeType::Cap,
+                authorized: only.amount,
+                expected: std::cmp::min(billed, only.amount),
+                finding_amount: if billed > only.amount {
+                    Some(billed - only.amount)
+                } else {
+                    None
+                },
+            },
+        },
+        many => FeeEvaluation::Conflicting {
+            amounts_differ: many.iter().any(|o| o.amount != many[0].amount),
+        },
+    }
+}
+
+/// The finding (if any) for a fee line, built from the shared evaluation so every caller reports
+/// identical text. EXACT, not-authorized and conflicting-amount wording is unchanged from earlier
+/// releases so carried-forward review decisions still match.
+pub fn fee_finding(
+    fee_code: &str,
+    line_description: &str,
+    billed: Money,
+    evaluation: &FeeEvaluation,
+) -> Option<DiscrepancyLine> {
+    match evaluation {
+        FeeEvaluation::NotAuthorized => Some(DiscrepancyLine {
+            discrepancy_type: DiscrepancyType::UnauthorizedFee,
+            description: format!(
+                "Fee '{}' ({}) billed but not found in contracted authorized fees",
+                fee_code, line_description
+            ),
+            amount: billed,
+            rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
+            confidence: Confidence::High,
+        }),
+        FeeEvaluation::Conflicting { amounts_differ } => Some(DiscrepancyLine {
+            discrepancy_type: DiscrepancyType::Other,
+            description: if *amounts_differ {
+                format!(
+                    "Fee '{}' is authorized at conflicting amounts by multiple rates; expected amount is ambiguous",
+                    fee_code
+                )
+            } else {
+                format!(
+                    "Fee '{}' is authorized with conflicting charge types by multiple rates; expected amount is ambiguous",
+                    fee_code
+                )
+            },
+            amount: Money::zero(),
+            rule_id: RULE_AMBIGUOUS_FEE.to_string(),
+            confidence: Confidence::High,
+        }),
+        FeeEvaluation::Unclassified { authorized } => Some(DiscrepancyLine {
+            discrepancy_type: DiscrepancyType::Other,
+            description: format!(
+                "Fee '{}' is authorized at {} but its charge type (exact or cap) has not been set; the expected amount cannot be determined until the fee is classified",
+                fee_code, authorized
+            ),
+            amount: Money::zero(),
+            rule_id: RULE_UNCLASSIFIED_FEE.to_string(),
+            confidence: Confidence::High,
+        }),
+        FeeEvaluation::Priced {
+            charge_type,
+            authorized,
+            finding_amount: Some(amount),
+            ..
+        } => Some(DiscrepancyLine {
+            discrepancy_type: DiscrepancyType::UnauthorizedFee,
+            description: match charge_type {
+                FeeChargeType::Exact => format!(
+                    "Fee '{}' billed at {} but authorized amount is {}",
+                    fee_code, billed, authorized
+                ),
+                FeeChargeType::Cap => format!(
+                    "Fee '{}' billed at {} exceeds the authorized cap of {}",
+                    fee_code, billed, authorized
+                ),
+            },
+            amount: *amount,
+            rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
+            confidence: Confidence::High,
+        }),
+        FeeEvaluation::Priced {
+            finding_amount: None,
+            ..
+        } => None,
+    }
+}
+
+/// Dollar amount RULE_04 attributes to a fee line (signed); zero when nothing is flagged or the
+/// outcome is unresolved (those report at $0).
+fn fee_attributed(options: &[AuthorizedFeeOption], billed: Money) -> Money {
+    match evaluate_authorized_fee(options, billed) {
+        FeeEvaluation::NotAuthorized => billed,
+        FeeEvaluation::Priced { finding_amount, .. } => finding_amount.unwrap_or_else(Money::zero),
+        FeeEvaluation::Conflicting { .. } | FeeEvaluation::Unclassified { .. } => Money::zero(),
+    }
+}
 
 pub fn check_rate_and_fees(invoice: &Invoice, rate: &ContractRate) -> Vec<DiscrepancyLine> {
     let mut out = Vec::new();
 
     for line in &invoice.line_items {
         if let Some(fee_code) = &line.fee_code {
-            let authorized = rate
-                .authorized_fees
-                .iter()
-                .find(|f| &f.fee_code == fee_code);
-
-            match authorized {
-                None => {
-                    out.push(DiscrepancyLine {
-                        discrepancy_type: DiscrepancyType::UnauthorizedFee,
-                        description: format!(
-                            "Fee '{}' ({}) billed but not found in contracted authorized fees",
-                            fee_code, line.description
-                        ),
-                        amount: line.line_total,
-                        rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
-                        confidence: Confidence::High,
-                    });
-                }
-                Some(auth_fee) if auth_fee.amount != line.line_total => {
-                    let diff = line.line_total - auth_fee.amount;
-                    out.push(DiscrepancyLine {
-                        discrepancy_type: DiscrepancyType::UnauthorizedFee,
-                        description: format!(
-                            "Fee '{}' billed at {} but authorized amount is {}",
-                            fee_code, line.line_total, auth_fee.amount
-                        ),
-                        amount: diff,
-                        rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
-                        confidence: Confidence::High,
-                    });
-                }
-                Some(_) => {}
-            }
+            // The shared evaluator decides EXACT / CAP / unclassified / conflicting outcomes.
+            let options = authorized_fee_options(&[rate], fee_code);
+            let evaluation = evaluate_authorized_fee(&options, line.line_total);
+            out.extend(fee_finding(
+                fee_code,
+                &line.description,
+                line.line_total,
+                &evaluation,
+            ));
 
             continue;
         }
@@ -104,56 +278,14 @@ pub fn check_rate_and_fees_multi(
 
     for line in &invoice.line_items {
         if let Some(fee_code) = &line.fee_code {
-            let amounts: Vec<Money> = rates
-                .iter()
-                .flat_map(|rate| rate.authorized_fees.iter())
-                .filter(|fee| &fee.fee_code == fee_code)
-                .map(|fee| fee.amount)
-                .collect();
-
-            let distinct: Vec<Money> =
-                amounts.into_iter().fold(Vec::new(), |mut acc, amount| {
-                    if !acc.contains(&amount) {
-                        acc.push(amount);
-                    }
-                    acc
-                });
-
-            match distinct.as_slice() {
-                [] => out.push(DiscrepancyLine {
-                    discrepancy_type: DiscrepancyType::UnauthorizedFee,
-                    description: format!(
-                        "Fee '{}' ({}) billed but not found in contracted authorized fees",
-                        fee_code, line.description
-                    ),
-                    amount: line.line_total,
-                    rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
-                    confidence: Confidence::High,
-                }),
-                [authorized] if *authorized != line.line_total => {
-                    out.push(DiscrepancyLine {
-                        discrepancy_type: DiscrepancyType::UnauthorizedFee,
-                        description: format!(
-                            "Fee '{}' billed at {} but authorized amount is {}",
-                            fee_code, line.line_total, authorized
-                        ),
-                        amount: line.line_total - *authorized,
-                        rule_id: RULE_UNAUTHORIZED_FEE.to_string(),
-                        confidence: Confidence::High,
-                    });
-                }
-                [_] => {}
-                _ => out.push(DiscrepancyLine {
-                    discrepancy_type: DiscrepancyType::Other,
-                    description: format!(
-                        "Fee '{}' has conflicting authorized amounts across applicable contract rates; manual review is required",
-                        fee_code
-                    ),
-                    amount: Money::zero(),
-                    rule_id: "RULE_11_AMBIGUOUS_RATE".to_string(),
-                    confidence: Confidence::High,
-                }),
-            }
+            let options = authorized_fee_options(rates, fee_code);
+            let evaluation = evaluate_authorized_fee(&options, line.line_total);
+            out.extend(fee_finding(
+                fee_code,
+                &line.description,
+                line.line_total,
+                &evaluation,
+            ));
 
             continue;
         }
@@ -420,11 +552,7 @@ fn already_attributed(line: &InvoiceLineItem, rate: Option<&ContractRate>) -> Mo
             Money::zero()
         }
     } else if let Some(code) = &line.fee_code {
-        match rate.authorized_fees.iter().find(|f| &f.fee_code == code) {
-            None => line.line_total,
-            Some(a) if a.amount != line.line_total => line.line_total - a.amount,
-            Some(_) => Money::zero(),
-        }
+        fee_attributed(&authorized_fee_options(&[rate], code), line.line_total)
     } else {
         Money::zero()
     }
@@ -585,25 +713,7 @@ fn already_attributed_multi(
         return Money::zero();
     };
 
-    let amounts: Vec<Money> = rates
-        .iter()
-        .flat_map(|rate| rate.authorized_fees.iter())
-        .filter(|fee| fee.fee_code == code)
-        .map(|fee| fee.amount)
-        .collect();
-
-    let distinct: Vec<Money> = amounts.into_iter().fold(Vec::new(), |mut acc, amount| {
-        if !acc.contains(&amount) {
-            acc.push(amount);
-        }
-        acc
-    });
-
-    match distinct.as_slice() {
-        [] => line.line_total,
-        [authorized] => line.line_total - *authorized,
-        _ => Money::zero(),
-    }
+    fee_attributed(&authorized_fee_options(rates, code), line.line_total)
 }
 
 /// RULE_08 waste stream mismatch: the invoice bills a different waste stream than the manifest
@@ -654,6 +764,7 @@ mod tests {
                 fee_code: "TRANSPORT".into(),
                 description: "Transportation".into(),
                 amount: Money::from_str_exact("500.00").unwrap(),
+                charge_type: Some(FeeChargeType::Exact),
             }],
             effective_from: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             effective_to: None,
@@ -983,6 +1094,7 @@ mod tests {
                 fee_code: "TRANSPORT".into(),
                 description: "t".into(),
                 amount: Money::from_decimal(Decimal::from(500)),
+                charge_type: Some(FeeChargeType::Exact),
             }],
             effective_from: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             effective_to: None,
@@ -1118,5 +1230,310 @@ mod tests {
         assert!(check_waste_stream_mismatch(&inv, &m("F0030")).is_some());
         // Internal whitespace is collapsed, NOT removed: "F 003" is a different identifier from "F003".
         assert!(check_waste_stream_mismatch(&inv, &m("F 003")).is_some());
+    }
+
+    // ---- shared authorized-fee evaluator (EXACT / CAP / unclassified / conflicting) ----
+
+    fn usd(n: i64) -> Money {
+        Money::from_decimal(Decimal::from(n))
+    }
+
+    fn opt(n: i64, charge_type: Option<FeeChargeType>) -> AuthorizedFeeOption {
+        AuthorizedFeeOption {
+            amount: usd(n),
+            charge_type,
+        }
+    }
+
+    /// (expected contribution, finding amount) of a priced fee; panics for any other outcome.
+    fn priced(evaluation: FeeEvaluation) -> (Money, Option<Money>) {
+        match evaluation {
+            FeeEvaluation::Priced {
+                expected,
+                finding_amount,
+                ..
+            } => (expected, finding_amount),
+            other => panic!("expected a priced fee, got {other:?}"),
+        }
+    }
+
+    fn fee_rate(charge_type: Option<FeeChargeType>) -> ContractRate {
+        let mut rate = drate();
+        rate.authorized_fees[0].charge_type = charge_type;
+        rate
+    }
+
+    #[test]
+    fn exact_fee_flags_any_difference_with_a_signed_amount() {
+        let exact = [opt(500, Some(FeeChargeType::Exact))];
+        assert_eq!(
+            priced(evaluate_authorized_fee(&exact, usd(400))),
+            (usd(500), Some(usd(-100)))
+        );
+        assert_eq!(
+            priced(evaluate_authorized_fee(&exact, usd(500))),
+            (usd(500), None)
+        );
+        assert_eq!(
+            priced(evaluate_authorized_fee(&exact, usd(600))),
+            (usd(500), Some(usd(100)))
+        );
+    }
+
+    #[test]
+    fn cap_fee_prices_at_the_lower_of_billed_and_cap_and_flags_only_the_excess() {
+        let cap = [opt(500, Some(FeeChargeType::Cap))];
+        assert_eq!(
+            priced(evaluate_authorized_fee(&cap, usd(400))),
+            (usd(400), None),
+            "a bill below the cap is not a discrepancy and is expected at the billed amount"
+        );
+        assert_eq!(
+            priced(evaluate_authorized_fee(&cap, usd(500))),
+            (usd(500), None)
+        );
+        assert_eq!(
+            priced(evaluate_authorized_fee(&cap, usd(600))),
+            (usd(500), Some(usd(100))),
+            "only the amount above the cap is flagged"
+        );
+    }
+
+    #[test]
+    fn credits_follow_the_same_sign_convention_for_exact_and_cap() {
+        // EXACT keeps its existing behavior: a credit differs from the authorized amount.
+        assert_eq!(
+            priced(evaluate_authorized_fee(
+                &[opt(500, Some(FeeChargeType::Exact))],
+                usd(-500)
+            )),
+            (usd(500), Some(usd(-1000)))
+        );
+        // A credit is below any cap: priced at the credit itself and never flagged.
+        assert_eq!(
+            priced(evaluate_authorized_fee(
+                &[opt(500, Some(FeeChargeType::Cap))],
+                usd(-50)
+            )),
+            (usd(-50), None)
+        );
+    }
+
+    #[test]
+    fn priced_fees_always_satisfy_billed_minus_expected_equals_finding() {
+        for charge_type in [FeeChargeType::Exact, FeeChargeType::Cap] {
+            for billed in [-600, -500, -1, 0, 1, 400, 499, 500, 501, 600, 100_000] {
+                let (expected, finding) = priced(evaluate_authorized_fee(
+                    &[opt(500, Some(charge_type))],
+                    usd(billed),
+                ));
+                assert_eq!(
+                    usd(billed) - expected,
+                    finding.unwrap_or_else(Money::zero),
+                    "{charge_type:?} billed {billed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unclassified_fee_is_never_inferred_as_exact_or_cap() {
+        for billed in [400, 500, 600] {
+            let evaluation = evaluate_authorized_fee(&[opt(500, None)], usd(billed));
+            assert_eq!(
+                evaluation,
+                FeeEvaluation::Unclassified {
+                    authorized: usd(500)
+                },
+                "billed {billed}"
+            );
+            assert!(evaluation.is_unresolved());
+            let finding = fee_finding("TRANSPORT", "Transportation", usd(billed), &evaluation)
+                .expect("an unclassified fee must be reported for review");
+            assert_eq!(finding.rule_id, RULE_UNCLASSIFIED_FEE);
+            assert_eq!(finding.amount, Money::zero());
+            assert!(matches!(finding.discrepancy_type, DiscrepancyType::Other));
+        }
+    }
+
+    #[test]
+    fn missing_authorization_is_not_authorized() {
+        let evaluation = evaluate_authorized_fee(&[], usd(200));
+        assert_eq!(evaluation, FeeEvaluation::NotAuthorized);
+        assert!(!evaluation.is_unresolved());
+    }
+
+    #[test]
+    fn conflicting_authorizations_are_unresolved_and_never_pick_a_candidate() {
+        // Different amounts.
+        let amounts = evaluate_authorized_fee(
+            &[
+                opt(500, Some(FeeChargeType::Exact)),
+                opt(450, Some(FeeChargeType::Exact)),
+            ],
+            usd(500),
+        );
+        assert_eq!(
+            amounts,
+            FeeEvaluation::Conflicting {
+                amounts_differ: true
+            }
+        );
+        // Same amount, different types.
+        let types = evaluate_authorized_fee(
+            &[
+                opt(500, Some(FeeChargeType::Exact)),
+                opt(500, Some(FeeChargeType::Cap)),
+            ],
+            usd(500),
+        );
+        assert_eq!(
+            types,
+            FeeEvaluation::Conflicting {
+                amounts_differ: false
+            }
+        );
+        // A classified and an unclassified authorization of the same amount are also ambiguous.
+        let mixed = evaluate_authorized_fee(
+            &[opt(500, Some(FeeChargeType::Exact)), opt(500, None)],
+            usd(500),
+        );
+        assert!(mixed.is_unresolved());
+        // Identical authorizations from several rates are one authorization, not a conflict.
+        let same = evaluate_authorized_fee(
+            &[
+                opt(500, Some(FeeChargeType::Cap)),
+                opt(500, Some(FeeChargeType::Cap)),
+            ],
+            usd(400),
+        );
+        assert_eq!(priced(same), (usd(400), None));
+    }
+
+    #[test]
+    fn fee_findings_keep_exact_wording_and_describe_the_cap_explicitly() {
+        let exact = evaluate_authorized_fee(&[opt(500, Some(FeeChargeType::Exact))], usd(600));
+        let f = fee_finding("TRANSPORT", "Transportation", usd(600), &exact).unwrap();
+        // This text is matched when review decisions are carried forward; it must not change.
+        assert_eq!(
+            f.description,
+            "Fee 'TRANSPORT' billed at $600.00 but authorized amount is $500.00"
+        );
+        assert_eq!(f.amount, usd(100));
+        assert_eq!(f.rule_id, RULE_UNAUTHORIZED_FEE);
+        assert!(matches!(f.discrepancy_type, DiscrepancyType::UnauthorizedFee));
+
+        let cap = evaluate_authorized_fee(&[opt(500, Some(FeeChargeType::Cap))], usd(600));
+        let f = fee_finding("TRANSPORT", "Transportation", usd(600), &cap).unwrap();
+        assert_eq!(
+            f.description,
+            "Fee 'TRANSPORT' billed at $600.00 exceeds the authorized cap of $500.00"
+        );
+        assert_eq!(f.amount, usd(100));
+        assert_eq!(f.rule_id, RULE_UNAUTHORIZED_FEE);
+
+        let below_cap = evaluate_authorized_fee(&[opt(500, Some(FeeChargeType::Cap))], usd(400));
+        assert!(fee_finding("TRANSPORT", "Transportation", usd(400), &below_cap).is_none());
+
+        let none = evaluate_authorized_fee(&[], usd(200));
+        let f = fee_finding("ENV_FEE", "Environmental fee", usd(200), &none).unwrap();
+        assert_eq!(
+            f.description,
+            "Fee 'ENV_FEE' (Environmental fee) billed but not found in contracted authorized fees"
+        );
+        assert_eq!(f.amount, usd(200));
+
+        let conflict = evaluate_authorized_fee(
+            &[
+                opt(500, Some(FeeChargeType::Exact)),
+                opt(450, Some(FeeChargeType::Exact)),
+            ],
+            usd(500),
+        );
+        let f = fee_finding("TRANSPORT", "Transportation", usd(500), &conflict).unwrap();
+        assert_eq!(
+            f.description,
+            "Fee 'TRANSPORT' is authorized at conflicting amounts by multiple rates; expected amount is ambiguous"
+        );
+        assert_eq!(f.rule_id, RULE_AMBIGUOUS_FEE);
+        assert_eq!(f.amount, Money::zero());
+    }
+
+    #[test]
+    fn fee_codes_match_ignoring_case_and_surrounding_whitespace() {
+        assert!(fee_codes_match(" transport ", "TRANSPORT"));
+        assert!(!fee_codes_match("TRANSPORT", "TRANSPORTS"));
+        let rate = drate();
+        let options = authorized_fee_options(&[&rate], "  transport");
+        assert_eq!(options, vec![opt(500, Some(FeeChargeType::Exact))]);
+    }
+
+    #[test]
+    fn legacy_single_rate_helper_delegates_cap_exact_and_unclassified_semantics() {
+        let bill = |amount: i64| {
+            dup_invoice(vec![dline(
+                "Transportation",
+                Some("TRANSPORT"),
+                1,
+                amount,
+                amount,
+            )])
+        };
+        let fee_findings = |findings: Vec<DiscrepancyLine>| -> Vec<DiscrepancyLine> {
+            findings
+                .into_iter()
+                .filter(|d| d.rule_id != RULE_UNIT_MISMATCH)
+                .collect()
+        };
+
+        let cap = fee_rate(Some(FeeChargeType::Cap));
+        assert!(fee_findings(check_rate_and_fees(&bill(400), &cap)).is_empty());
+        let above = fee_findings(check_rate_and_fees(&bill(600), &cap));
+        assert_eq!(above.len(), 1);
+        assert_eq!(above[0].amount, usd(100));
+
+        let exact = fee_rate(Some(FeeChargeType::Exact));
+        let below = fee_findings(check_rate_and_fees(&bill(400), &exact));
+        assert_eq!(below.len(), 1);
+        assert_eq!(below[0].amount, usd(-100));
+
+        let unclassified = fee_rate(None);
+        let findings = fee_findings(check_rate_and_fees(&bill(500), &unclassified));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RULE_UNCLASSIFIED_FEE);
+        assert_eq!(findings[0].amount, Money::zero());
+    }
+
+    #[test]
+    fn legacy_multi_rate_helper_reports_conflicting_fee_types_without_choosing() {
+        let cap = fee_rate(Some(FeeChargeType::Cap));
+        let exact = fee_rate(Some(FeeChargeType::Exact));
+        let inv = dup_invoice(vec![dline("Transportation", Some("TRANSPORT"), 1, 400, 400)]);
+        let findings = check_rate_and_fees_multi(&inv, &[&cap, &exact]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, RULE_AMBIGUOUS_FEE);
+        assert_eq!(findings[0].amount, Money::zero());
+    }
+
+    #[test]
+    fn duplicate_fee_attribution_follows_exact_and_cap_semantics() {
+        let inv = dup_invoice(vec![
+            dline("Transportation", Some("TRANSPORT"), 1, 400, 400),
+            dline("Transportation", Some("TRANSPORT"), 1, 400, 400),
+        ]);
+        // EXACT $500 billed $400: RULE_04 already claims -$100 on the duplicate, so RULE_05 adds the
+        // remaining $500 and the two together equal the duplicate line's $400.
+        let exact = fee_rate(Some(FeeChargeType::Exact));
+        let r5 = check_duplicate_charges(&inv, Some(&exact), &[]);
+        assert_eq!(r5.len(), 1);
+        assert_eq!(r5[0].amount, usd(500));
+        // CAP $500 billed $400: RULE_04 claims nothing, so the whole duplicate line is RULE_05's.
+        let cap = fee_rate(Some(FeeChargeType::Cap));
+        let r5 = check_duplicate_charges(&inv, Some(&cap), &[]);
+        assert_eq!(r5.len(), 1);
+        assert_eq!(r5[0].amount, usd(400));
+        // The multi-rate variant agrees.
+        let r5m = check_duplicate_charges_multi(&inv, &[&cap], &[]);
+        assert_eq!(r5m[0].amount, usd(400));
     }
 }
