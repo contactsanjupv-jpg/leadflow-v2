@@ -34,9 +34,15 @@ pub async fn enqueue_reconcile_pending(
     Ok(n > 0)
 }
 
-/// Invoices that have never been reconciled, or whose inputs (invoice, rate, manifest, weight
-/// tickets) changed after their latest reconciliation. Already-current invoices are skipped, so
-/// repeated monitoring never churns the review queue.
+/// Invoices that have never been reconciled, or whose inputs (invoice, rate, authorized-fee
+/// classification, manifest, weight tickets) changed after their latest reconciliation.
+/// Already-current invoices are skipped, so repeated monitoring never churns the review queue.
+///
+/// An authorized fee is classified (EXACT/CAP) after the fact through the classify endpoint, which
+/// stamps `charge_type_set_at`; the rate row itself does not change, so the rate clause alone would
+/// not notice it. Like the rate clause, the fee clause matches on vendor and waste-stream key. The
+/// comparison is strictly "newer than the latest reconciliation", so one re-run makes the invoice
+/// current again, and earlier reconciliations and evidence snapshots are never rewritten.
 pub async fn invoices_needing_reconciliation(
     tx: &mut Transaction<'_, Postgres>,
     limit: i64,
@@ -47,6 +53,7 @@ pub async fn invoices_needing_reconciliation(
            WHERE lr.created_at IS NULL
               OR i.updated_at > lr.created_at
               OR EXISTS (SELECT 1 FROM contract_rates cr WHERE cr.vendor_id = i.vendor_id AND cr.waste_stream_key = i.waste_stream_key AND cr.created_at > lr.created_at)
+              OR EXISTS (SELECT 1 FROM contract_rates cr JOIN contract_authorized_fees f ON f.contract_rate_id = cr.id WHERE cr.vendor_id = i.vendor_id AND cr.waste_stream_key = i.waste_stream_key AND f.charge_type_set_at > lr.created_at)
               OR EXISTS (SELECT 1 FROM manifests m WHERE m.id = i.manifest_id AND m.created_at > lr.created_at)
               OR EXISTS (SELECT 1 FROM weight_records w WHERE w.manifest_id = i.manifest_id AND w.created_at > lr.created_at)
            ORDER BY i.created_at LIMIT $1"#,
@@ -83,7 +90,8 @@ pub async fn run_reconcile_pending(
         processed += 1;
         if !outcome.result.discrepancies.is_empty() {
             new_findings += outcome.result.discrepancies.len();
-            identified_finding_total = identified_finding_total + outcome.result.identified_finding_amount;
+            identified_finding_total =
+                identified_finding_total + outcome.result.identified_finding_amount;
         }
         match outcome.result.pricing_status {
             crate::reconciliation::model::PricingStatus::Complete => {

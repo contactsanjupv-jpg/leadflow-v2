@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import { isValidDecimal } from "@/lib/money";
 import DateInput from "@/components/DateInput";
 import SourceDoc from "@/components/SourceDoc";
@@ -14,10 +14,20 @@ type Contract = {
   vendor_id: string;
   vendor_name: string;
 };
+type FeeType = "EXACT" | "CAP";
+// Form state for a new fee. charge_type starts empty ("" = nothing chosen) and must be picked.
 type FeeDraft = {
   fee_code: string;
   description: string;
   amount: string;
+  charge_type: FeeType | "";
+};
+// A saved fee as returned by the API; charge_type is null for a legacy (unclassified) fee.
+type AuthorizedFee = {
+  fee_code: string;
+  description: string | null;
+  amount: string;
+  charge_type: FeeType | null;
 };
 type Rate = {
   id: string;
@@ -26,7 +36,7 @@ type Rate = {
   unit_rate: string;
   effective_from: string;
   effective_to: string | null;
-  authorized_fees: FeeDraft[];
+  authorized_fees: AuthorizedFee[];
 };
 type ContractDetail = Contract & { rates?: Rate[] };
 type Manifest = {
@@ -64,7 +74,34 @@ const blankFee = (): FeeDraft => ({
   fee_code: "",
   description: "",
   amount: "",
+  charge_type: "",
 });
+
+const FEE_TYPE_LABEL: Record<FeeType, string> = { EXACT: "Exact", CAP: "Cap" };
+
+const feeKey = (rate: Rate, fee: AuthorizedFee) => `${rate.id}:${fee.fee_code}`;
+
+// Turn an API failure into a message that says what to do. The app's own 409/422 responses carry
+// a clear server message; a 422 that is not in the application envelope (for example an unknown
+// field rejected by the framework) only has a status, so give it a generic explanation.
+function feeErrorMessage(e: unknown, action: "save" | "classify"): string {
+  if (e instanceof ApiError) {
+    if (e.status === 409) return e.message;
+    if (e.status === 422) {
+      return e.code === "UNPROCESSABLE_ENTITY"
+        ? e.message
+        : `The server rejected the request (422). Choose Exact or Cap for the fee and try again.`;
+    }
+    if (action === "classify" && e.status === 403) {
+      return "You do not have permission to classify authorized fees.";
+    }
+    if (action === "classify" && e.status === 404) {
+      return "This fee or rate no longer exists. Reload the contract and try again.";
+    }
+    return e.message;
+  }
+  return e instanceof Error ? e.message : "Request failed";
+}
 
 export default function DataManagement() {
   const [tab, setTab] = useState<Tab>("Vendors");
@@ -98,6 +135,12 @@ export default function DataManagement() {
   });
 
   const [fees, setFees] = useState<FeeDraft[]>([]);
+
+  // Classification of legacy fees: the type chosen per fee, and the fee awaiting confirmation.
+  const [classifyChoice, setClassifyChoice] = useState<
+    Record<string, FeeType | "">
+  >({});
+  const [classifyPending, setClassifyPending] = useState<string | null>(null);
 
   const [manifestForm, setManifestForm] = useState({
     manifest_number: "",
@@ -196,9 +239,20 @@ export default function DataManagement() {
       return;
     }
 
-    const created = await act.run(
-      () =>
-        api<ContractDetail>(
+    if (
+      fees.some((fee) => fee.charge_type !== "EXACT" && fee.charge_type !== "CAP")
+    ) {
+      await act.run(async () => {
+        throw new Error(
+          "Every authorized fee must have a charge type: Exact or Cap",
+        );
+      });
+      return;
+    }
+
+    const created = await act.run(async () => {
+      try {
+        return await api<ContractDetail>(
           "POST",
           `/contracts/${selectedContractId}/rates`,
           {
@@ -212,11 +266,14 @@ export default function DataManagement() {
               fee_code: fee.fee_code,
               description: fee.description || null,
               amount: fee.amount,
+              charge_type: fee.charge_type,
             })),
           },
-        ),
-      "Rate saved",
-    );
+        );
+      } catch (e) {
+        throw new Error(feeErrorMessage(e, "save"));
+      }
+    }, "Rate saved");
 
     if (!created) return;
 
@@ -344,6 +401,35 @@ export default function DataManagement() {
     });
 
     await tickets.reload();
+  }
+
+  // Classify a legacy fee once. The server enforces "once": a second attempt (for example from a
+  // stale screen) is a 409, after which the contract is reloaded to show the current type.
+  async function classifyFee(rate: Rate, fee: AuthorizedFee) {
+    const key = feeKey(rate, fee);
+    const chargeType = classifyChoice[key];
+    if (chargeType !== "EXACT" && chargeType !== "CAP") return;
+
+    const updated = await act.run(async () => {
+      try {
+        return await api<ContractDetail>(
+          "PUT",
+          `/rates/${rate.id}/fees/${encodeURIComponent(fee.fee_code)}/type`,
+          { charge_type: chargeType },
+        );
+      } catch (e) {
+        throw new Error(feeErrorMessage(e, "classify"));
+      }
+    }, `Fee ${fee.fee_code} classified as ${FEE_TYPE_LABEL[chargeType]}`);
+
+    setClassifyPending(null);
+    if (updated) {
+      setClassifyChoice((current) => {
+        const { [key]: _done, ...rest } = current;
+        return rest;
+      });
+    }
+    await selectedContract.reload();
   }
 
   function setFee(index: number, key: keyof FeeDraft, value: string) {
@@ -576,6 +662,18 @@ export default function DataManagement() {
               <>
                 <Err e={selectedContract.error} />
 
+                {rateList.some((rate) =>
+                  rate.authorized_fees?.some((fee) => !fee.charge_type),
+                ) && (
+                  <p className="muted">
+                    Some authorized fees are unclassified. Invoices that bill them
+                    reconcile as Partial until each fee is set to Exact (the
+                    invoice fee must equal the amount) or Cap (the invoice fee may
+                    be at most the amount). A fee&apos;s type can be set once and
+                    cannot be changed afterwards.
+                  </p>
+                )}
+
                 <table>
                   <thead>
                     <tr>
@@ -597,13 +695,89 @@ export default function DataManagement() {
                         <td>{rate.effective_from}</td>
                         <td>{rate.effective_to ?? "Open-ended"}</td>
                         <td>
-                          {rate.authorized_fees?.length
-                            ? rate.authorized_fees
-                                .map(
-                                  (fee) => `${fee.fee_code}: ${fee.amount}`,
-                                )
-                                .join("; ")
-                            : "None"}
+                          {rate.authorized_fees?.length ? (
+                            <ul style={{ margin: 0, paddingLeft: 16 }}>
+                              {rate.authorized_fees.map((fee) => {
+                                const key = feeKey(rate, fee);
+                                const choice = classifyChoice[key] ?? "";
+                                return (
+                                  <li key={fee.fee_code}>
+                                    {fee.fee_code}: {fee.amount}{" "}
+                                    {fee.charge_type ? (
+                                      <span className="badge">
+                                        {FEE_TYPE_LABEL[fee.charge_type] ??
+                                          fee.charge_type}
+                                      </span>
+                                    ) : (
+                                      <>
+                                        <span className="badge b-NEW">
+                                          Unclassified
+                                        </span>{" "}
+                                        <select
+                                          aria-label={`Charge type for ${fee.fee_code}`}
+                                          value={choice}
+                                          onChange={(e) => {
+                                            setClassifyChoice((current) => ({
+                                              ...current,
+                                              [key]: e.target.value as
+                                                | FeeType
+                                                | "",
+                                            }));
+                                            setClassifyPending(null);
+                                          }}
+                                        >
+                                          <option value="">Select type…</option>
+                                          <option value="EXACT">Exact</option>
+                                          <option value="CAP">Cap</option>
+                                        </select>{" "}
+                                        {classifyPending === key && choice ? (
+                                          <>
+                                            <span>
+                                              Permanently set to{" "}
+                                              {FEE_TYPE_LABEL[choice]}?
+                                            </span>{" "}
+                                            <button
+                                              type="button"
+                                              aria-label={`Confirm classify ${fee.fee_code}`}
+                                              disabled={act.busy}
+                                              onClick={() =>
+                                                void classifyFee(rate, fee)
+                                              }
+                                            >
+                                              Confirm
+                                            </button>{" "}
+                                            <button
+                                              type="button"
+                                              className="sec"
+                                              aria-label={`Cancel classify ${fee.fee_code}`}
+                                              onClick={() =>
+                                                setClassifyPending(null)
+                                              }
+                                            >
+                                              Cancel
+                                            </button>
+                                          </>
+                                        ) : (
+                                          <button
+                                            type="button"
+                                            aria-label={`Classify ${fee.fee_code}`}
+                                            disabled={act.busy || !choice}
+                                            onClick={() =>
+                                              setClassifyPending(key)
+                                            }
+                                          >
+                                            Classify
+                                          </button>
+                                        )}
+                                      </>
+                                    )}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          ) : (
+                            "None"
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -695,6 +869,13 @@ export default function DataManagement() {
 
                   <h3>Authorized fees</h3>
 
+                  <p className="muted">
+                    Charge type is required for every fee: <b>Exact</b> means the
+                    invoice fee must equal the amount, <b>Cap</b> means it may be
+                    at most the amount. It cannot be changed after the rate is
+                    saved.
+                  </p>
+
                   {fees.map((fee, index) => (
                     <div className="row" key={index}>
                       <label>
@@ -730,6 +911,21 @@ export default function DataManagement() {
                           required
                           inputMode="decimal"
                         />
+                      </label>
+
+                      <label>
+                        Charge type
+                        <select
+                          value={fee.charge_type}
+                          onChange={(e) =>
+                            setFee(index, "charge_type", e.target.value)
+                          }
+                          required
+                        >
+                          <option value="">Select type…</option>
+                          <option value="EXACT">Exact — fee must equal amount</option>
+                          <option value="CAP">Cap — fee may be at most amount</option>
+                        </select>
                       </label>
 
                       <button

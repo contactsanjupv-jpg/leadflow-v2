@@ -142,7 +142,7 @@ impl TestApp {
         sqlx::query("INSERT INTO contracts (id, organization_id, vendor_id, name) VALUES ($1, $2, $3, 'Test Contract')").bind(contract_id).bind(org_id).bind(vendor_id).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO contract_rates (id, organization_id, contract_id, vendor_id, waste_stream, unit, unit_rate, effective_from) VALUES ($1, $2, $3, $4, 'F003', 'drum', 400.00, '2026-01-01')")
             .bind(rate_id).bind(org_id).bind(contract_id).bind(vendor_id).execute(&mut *tx).await.unwrap();
-        sqlx::query("INSERT INTO contract_authorized_fees (contract_rate_id, fee_code, description, amount) VALUES ($1, 'TRANSPORT', 'Transportation', 500.00)").bind(rate_id).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO contract_authorized_fees (contract_rate_id, fee_code, description, amount, charge_type, charge_type_set_at) VALUES ($1, 'TRANSPORT', 'Transportation', 500.00, 'EXACT', now())").bind(rate_id).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO invoices (id, organization_id, vendor_id, invoice_number, invoice_date, service_date, waste_stream, total) VALUES ($1, $2, $3, 'INV-1001', '2026-03-15', '2026-03-10', 'F003', 5200.00)")
             .bind(invoice_id).bind(org_id).bind(vendor_id).execute(&mut *tx).await.unwrap();
         for (desc, fee, qty, unit, price, total) in [

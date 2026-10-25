@@ -32,7 +32,7 @@ async fn vendor_contract(app: &TestApp, org: &TestOrg, tag: &str) -> String {
     .await;
     ok(app, org, &format!("/api/v1/contracts/{}/rates", c["id"].as_str().unwrap()), json!({
         "waste_stream": "F003", "unit": "drum", "unit_rate": "400.00", "effective_from": "2026-01-01",
-        "authorized_fees": [{ "fee_code": "TRANSPORT", "amount": "500.00" }] })).await;
+        "authorized_fees": [{ "fee_code": "TRANSPORT", "amount": "500.00", "charge_type": "EXACT" }] })).await;
     vid
 }
 

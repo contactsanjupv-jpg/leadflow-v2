@@ -7,6 +7,11 @@ use serde_json::json;
 pub enum AppError {
     #[error("validation error: {0}")]
     Validation(String),
+    /// The request was well-formed but semantically unacceptable (HTTP 422), e.g. a new
+    /// authorized fee with a missing or unrecognised `charge_type`. Everything else keeps using
+    /// `Validation` (HTTP 400); only use this where a caller must tell the two apart.
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
     #[error("authentication required")]
     Authentication,
     #[error("not authorized")]
@@ -31,6 +36,11 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message) = match &self {
             AppError::Validation(m) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", m.clone()),
+            AppError::Unprocessable(m) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "UNPROCESSABLE_ENTITY",
+                m.clone(),
+            ),
             AppError::Authentication => (
                 StatusCode::UNAUTHORIZED,
                 "AUTHENTICATION_ERROR",
@@ -84,5 +94,46 @@ impl IntoResponse for AppError {
             Json(json!({ "error": { "code": code, "message": message } })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    async fn render(e: AppError) -> (StatusCode, Value) {
+        let resp = e.into_response();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn unprocessable_is_422_in_the_standard_error_envelope() {
+        let (status, body) = render(AppError::Unprocessable(
+            "charge_type must be EXACT or CAP".into(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "UNPROCESSABLE_ENTITY");
+        assert_eq!(body["error"]["message"], "charge_type must be EXACT or CAP");
+    }
+
+    #[tokio::test]
+    async fn validation_remains_400() {
+        let (status, body) = render(AppError::Validation("bad input".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+        assert_eq!(body["error"]["message"], "bad input");
+    }
+
+    #[test]
+    fn unprocessable_display_names_the_reason() {
+        assert_eq!(
+            AppError::Unprocessable("x".into()).to_string(),
+            "unprocessable: x"
+        );
     }
 }

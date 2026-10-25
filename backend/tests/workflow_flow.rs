@@ -40,7 +40,7 @@ async fn setup(
     let cid = contract["id"].as_str().unwrap();
     ok(app, org, &format!("/api/v1/contracts/{cid}/rates"), json!({
         "waste_stream": "F003", "unit": "drum", "unit_rate": "400.00", "effective_from": "2026-01-01",
-        "authorized_fees": [{ "fee_code": "TRANSPORT", "description": "Transportation", "amount": "500.00" }]
+        "authorized_fees": [{ "fee_code": "TRANSPORT", "description": "Transportation", "amount": "500.00", "charge_type": "EXACT" }]
     })).await;
     let manifest = ok(app, org, "/api/v1/manifests", json!({ "manifest_number": format!("M-{tag}"), "waste_stream": "F003", "container_count": 10, "quantity": manifest_qty, "unit": "drum", "shipment_date": "2026-03-09" })).await;
     let mid = manifest["id"].as_str().unwrap().to_string();

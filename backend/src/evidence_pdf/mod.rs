@@ -278,6 +278,19 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+/// How an authorized fee's `charge_type` reads in the evidence PDF. An explicit `null` means the fee
+/// was unclassified when the evidence was built; a missing key means the evidence package predates
+/// charge types, so it says nothing either way. Neither is ever shown as EXACT or CAP.
+fn fee_charge_label(fee: &Value) -> &'static str {
+    match fee.get("charge_type") {
+        None => "type not recorded in this evidence package",
+        Some(Value::Null) => "unclassified: type not set",
+        Some(Value::String(t)) if t == "EXACT" => "exact charge",
+        Some(Value::String(t)) if t == "CAP" => "cap: maximum allowed",
+        Some(_) => "unrecognised charge type",
+    }
+}
+
 /// "5200.0000" -> "$5,200.00" working on the decimal STRING only (no floats).
 pub fn money(v: &str) -> String {
     let v = v.trim();
@@ -465,7 +478,12 @@ pub fn render(
             for f in fees {
                 p.field(
                     "Authorized fee",
-                    &format!("{} - {}", s(f, "fee_code"), money(s(f, "amount"))),
+                    &format!(
+                        "{} - {} [{}]",
+                        s(f, "fee_code"),
+                        money(s(f, "amount")),
+                        fee_charge_label(f)
+                    ),
                 );
             }
             if fees.is_empty() {
@@ -638,6 +656,59 @@ mod tests {
             assert!(t.contains(needle), "PDF text is missing {needle:?}");
         }
     }
+    #[test]
+    fn fee_charge_label_never_invents_a_type() {
+        assert_eq!(
+            fee_charge_label(&json!({ "charge_type": "EXACT" })),
+            "exact charge"
+        );
+        assert_eq!(
+            fee_charge_label(&json!({ "charge_type": "CAP" })),
+            "cap: maximum allowed"
+        );
+        assert_eq!(
+            fee_charge_label(&json!({ "charge_type": null })),
+            "unclassified: type not set"
+        );
+        assert_eq!(
+            fee_charge_label(&json!({ "fee_code": "X" })),
+            "type not recorded in this evidence package"
+        );
+        for bad in [json!("exact"), json!("MAX"), json!(""), json!(5)] {
+            assert_eq!(
+                fee_charge_label(&json!({ "charge_type": bad })),
+                "unrecognised charge type"
+            );
+        }
+    }
+
+    #[test]
+    fn render_shows_each_authorized_fee_type_and_exact_amounts() {
+        let content = json!({
+            "discrepancy": { "invoice_number": "INV-1", "vendor_name": "Acme", "description": "d", "discrepancy_type": "RATE_MISMATCH", "rule_id": "R", "amount": "500.0000", "confidence": "High", "review_status": "CONFIRMED" },
+            "reconciliation": { "pricing_status": "PARTIAL", "invoiced_amount": "5200.0000", "identified_finding_amount": "0.0000", "engine_version": "1", "calculation_trace": [] },
+            "invoice": { "invoice_number": "INV-1", "invoice_date": "2026-03-15", "service_date": "2026-03-10", "waste_stream": "F003", "total": "5200.0000", "lines": [] },
+            "contract_rate": { "contract_name": "C", "waste_stream": "F003", "unit": "drum", "unit_rate": "400.0000", "effective_from": "2026-01-01", "effective_to": null,
+                "authorized_fees": [
+                    { "fee_code": "TRANSPORT", "amount": "500.0000", "charge_type": "EXACT" },
+                    { "fee_code": "ENV_FEE", "amount": "200.0000", "charge_type": "CAP" },
+                    { "fee_code": "LEGACY", "amount": "10.0000", "charge_type": null },
+                    { "fee_code": "OLDEVIDENCE", "amount": "20.0000" }
+                ] },
+            "manifest": null, "weight_tickets": [], "source_documents": []
+        });
+        let pdf = render("Org", "pkg", "2026-10-01", &content);
+        let t = String::from_utf8_lossy(&pdf).to_string();
+        for needle in [
+            "TRANSPORT - $500.00 [exact charge]",
+            "ENV_FEE - $200.00 [cap: maximum allowed]",
+            "LEGACY - $10.00 [unclassified: type not set]",
+            "OLDEVIDENCE - $20.00 [type not recorded in this evidence package]",
+        ] {
+            assert!(t.contains(needle), "PDF text is missing {needle:?}");
+        }
+    }
+
     #[test]
     fn incomplete_pricing_is_labeled_and_partial_subtotal_is_not_full_expected_amount() {
         let content = json!({

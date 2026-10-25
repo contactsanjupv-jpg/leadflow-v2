@@ -183,7 +183,7 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
     ).bind(invoice_id).fetch_one(&mut **tx).await?;
     // Parent rate kept for backward compatibility with existing evidence consumers.
     let rate: Option<Value> = sqlx::query_scalar(
-        "SELECT to_jsonb(cr) || jsonb_build_object('authorized_fees', (SELECT coalesce(jsonb_agg(jsonb_build_object('fee_code', f.fee_code, 'description', f.description, 'amount', f.amount::text) ORDER BY f.fee_code), '[]'::jsonb)
+        "SELECT to_jsonb(cr) || jsonb_build_object('authorized_fees', (SELECT coalesce(jsonb_agg(jsonb_build_object('fee_code', f.fee_code, 'description', f.description, 'amount', f.amount::text, 'charge_type', f.charge_type) ORDER BY f.fee_code), '[]'::jsonb)
                 FROM contract_authorized_fees f WHERE f.contract_rate_id = cr.id), 'contract_name', (SELECT name FROM contracts WHERE id = cr.contract_id), 'contract_source_document_id', (SELECT source_document_id FROM contracts WHERE id = cr.contract_id))
          FROM (SELECT id, contract_id, waste_stream, unit, unit_rate::text AS unit_rate, effective_from, effective_to FROM contract_rates WHERE id = (SELECT contract_rate_id FROM reconciliations WHERE id = $1)) cr",
     ).bind(rec_id).fetch_optional(&mut **tx).await?;

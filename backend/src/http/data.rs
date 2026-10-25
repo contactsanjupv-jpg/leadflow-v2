@@ -7,7 +7,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,6 +20,7 @@ use crate::http::errors::AppError;
 use crate::http::state::AppState;
 use crate::http::util::*;
 use crate::rbac::Permission;
+use crate::reconciliation::model::FeeChargeType;
 
 type Created = Result<(StatusCode, Json<Value>), AppError>;
 
@@ -90,7 +91,7 @@ const CONTRACT_DETAIL_SQL: &str = r#"
 SELECT to_jsonb(c) || jsonb_build_object('rates', coalesce((
     SELECT jsonb_agg(to_jsonb(r) ORDER BY r.effective_from, r.id) FROM (
         SELECT cr.id, cr.waste_stream, cr.unit, cr.unit_rate::text AS unit_rate, cr.facility_id, cr.effective_from, cr.effective_to,
-               (SELECT coalesce(jsonb_agg(jsonb_build_object('fee_code', f.fee_code, 'description', f.description, 'amount', f.amount::text) ORDER BY f.fee_code), '[]'::jsonb)
+               (SELECT coalesce(jsonb_agg(jsonb_build_object('fee_code', f.fee_code, 'description', f.description, 'amount', f.amount::text, 'charge_type', f.charge_type) ORDER BY f.fee_code), '[]'::jsonb)
                   FROM contract_authorized_fees f WHERE f.contract_rate_id = cr.id) AS authorized_fees
           FROM contract_rates cr WHERE cr.contract_id = c.id) r), '[]'::jsonb))
 FROM (SELECT id, vendor_id, name, source_document_id, created_at FROM contracts WHERE id = $1) c"#;
@@ -162,6 +163,33 @@ pub struct NewFee {
     pub fee_code: String,
     pub description: Option<String>,
     pub amount: ExactDecimal,
+    /// `"EXACT"` or `"CAP"`. Kept as an untyped JSON value on purpose: deserialising straight into
+    /// `FeeChargeType` would turn a bad value into axum's default plain-text 422 instead of the
+    /// application error envelope. `parse_new_fee_charge_type` validates it and is the only place
+    /// that decides what a missing or invalid value means (never defaulted, never inferred).
+    #[serde(default)]
+    pub charge_type: Option<Value>,
+}
+
+/// A new authorized fee must say whether its amount is an exact charge or a cap. A missing, `null`,
+/// non-string, differently-cased or unknown value is rejected with the JSON 422 (`Unprocessable`).
+fn parse_new_fee_charge_type(
+    fee_code: &str,
+    raw: Option<&Value>,
+) -> Result<FeeChargeType, AppError> {
+    match raw {
+        None => Err(AppError::Unprocessable(format!(
+            "charge_type is required for authorized fee '{fee_code}' and must be EXACT or CAP"
+        ))),
+        Some(Value::String(s)) => FeeChargeType::from_db(s).ok_or_else(|| {
+            AppError::Unprocessable(format!(
+                "charge_type for authorized fee '{fee_code}' must be EXACT or CAP"
+            ))
+        }),
+        Some(_) => Err(AppError::Unprocessable(format!(
+            "charge_type for authorized fee '{fee_code}' must be the string EXACT or CAP"
+        ))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -207,13 +235,16 @@ pub async fn create_rate(
                 "authorized fee amounts must not be negative".into(),
             ));
         }
+        let code = clean_text("fee_code", &f.fee_code, 50)?;
+        let charge_type = parse_new_fee_charge_type(&code, f.charge_type.as_ref())?;
         fees.push((
-            clean_text("fee_code", &f.fee_code, 50)?,
+            code,
             f.description
                 .as_deref()
                 .map(|d| d.trim().to_string())
                 .filter(|d| !d.is_empty()),
             f.amount.get(),
+            charge_type,
         ));
     }
 
@@ -232,9 +263,10 @@ pub async fn create_rate(
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| conflict_on_constraint(e, "an overlapping rate already exists for this vendor, waste stream and facility"))?;
-    for (code, description, amount) in &fees {
-        sqlx::query("INSERT INTO contract_authorized_fees (contract_rate_id, fee_code, description, amount) VALUES ($1, $2, $3, $4)")
-            .bind(rate_id).bind(code).bind(description).bind(amount).execute(&mut *tx).await
+    for (code, description, amount, charge_type) in &fees {
+        // charge_type and charge_type_set_at must be written together (migration 0011 CHECK).
+        sqlx::query("INSERT INTO contract_authorized_fees (contract_rate_id, fee_code, description, amount, charge_type, charge_type_set_at, charge_type_set_by) VALUES ($1, $2, $3, $4, $5, now(), $6)")
+            .bind(rate_id).bind(code).bind(description).bind(amount).bind(charge_type.as_db()).bind(user.user_id).execute(&mut *tx).await
             .map_err(|e| conflict_on_constraint(e, "duplicate fee_code within this rate"))?;
     }
     audit::record(&mut tx, user.organization_id, Some(user.user_id), "contract_rate.create", "contract_rate", Some(rate_id), None,
@@ -283,6 +315,92 @@ pub async fn end_rate(
         Some(rate_id),
         Some(json!({ "effective_to": old_to })),
         Some(json!({ "effective_to": req.effective_to })),
+    )
+    .await?;
+    let body = json_one(&mut tx, CONTRACT_DETAIL_SQL, contract_id).await?;
+    tx.commit().await?;
+    Ok(Json(body))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifyFee {
+    /// `"EXACT"` or `"CAP"`; validated by `parse_new_fee_charge_type` (same rules as fee creation).
+    #[serde(default)]
+    pub charge_type: Option<Value>,
+}
+
+/// Classify a legacy (unclassified) authorized fee as EXACT or CAP.
+///
+/// This is the only way to give an existing fee a type, and it works exactly once per fee: a
+/// classified fee is immutable (also enforced by a database trigger), because changing what a
+/// contracted fee means needs a new rate version. The change is audited with old and new values,
+/// actor and time. Earlier reconciliations and evidence snapshots are not touched; invoices are
+/// re-reconciled afterwards by the monitoring worker, which compares `charge_type_set_at` with the
+/// latest reconciliation.
+pub async fn classify_fee(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path((rate_id, fee_code)): Path<(Uuid, String)>,
+    Json(req): Json<ClassifyFee>,
+) -> Result<Json<Value>, AppError> {
+    user.require(Permission::ManageData)?;
+    let fee_code = clean_text("fee_code", &fee_code, 50)?;
+    let charge_type = parse_new_fee_charge_type(&fee_code, req.charge_type.as_ref())?;
+
+    let mut tx = scoped_tx(&state, &user).await?;
+    // RLS hides other tenants' rates and fees, so an unknown and a foreign id are both 404.
+    // The row lock serialises concurrent attempts: the second one sees the fee as classified.
+    let row: Option<(Uuid, Option<String>, Uuid)> = sqlx::query_as(
+        "SELECT f.id, f.charge_type, cr.contract_id
+           FROM contract_authorized_fees f
+           JOIN contract_rates cr ON cr.id = f.contract_rate_id
+          WHERE f.contract_rate_id = $1 AND f.fee_code = $2
+            FOR UPDATE OF f",
+    )
+    .bind(rate_id)
+    .bind(&fee_code)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (fee_id, current, contract_id) = row.ok_or(AppError::NotFound)?;
+    if let Some(existing) = current {
+        return Err(AppError::Conflict(format!(
+            "authorized fee '{fee_code}' is already classified as {existing} and cannot be changed; \
+             a different meaning requires a new rate version"
+        )));
+    }
+    let set_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "UPDATE contract_authorized_fees
+            SET charge_type = $2, charge_type_set_at = now(), charge_type_set_by = $3
+          WHERE id = $1 AND charge_type IS NULL
+      RETURNING charge_type_set_at",
+    )
+    .bind(fee_id)
+    .bind(charge_type.as_db())
+    .bind(user.user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    let set_at = set_at.ok_or_else(|| {
+        AppError::Conflict(format!(
+            "authorized fee '{fee_code}' was classified by another request"
+        ))
+    })?;
+    audit::record(
+        &mut tx,
+        user.organization_id,
+        Some(user.user_id),
+        "contract_authorized_fee.classify",
+        "contract_authorized_fee",
+        Some(fee_id),
+        Some(json!({ "charge_type": null })),
+        Some(json!({
+            "charge_type": charge_type.as_db(),
+            "fee_code": fee_code,
+            "contract_rate_id": rate_id,
+            "classified_by": user.user_id,
+            "classified_at": set_at,
+        })),
     )
     .await?;
     let body = json_one(&mut tx, CONTRACT_DETAIL_SQL, contract_id).await?;
@@ -690,4 +808,96 @@ pub async fn get_weight_ticket(
     user.require(Permission::ViewData)?;
     let mut tx = scoped_tx(&state, &user).await?;
     Ok(Json(json_one(&mut tx, WEIGHT_DETAIL_SQL, id).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rejected(raw: Option<&Value>) -> String {
+        match parse_new_fee_charge_type("TRANSPORT", raw) {
+            Err(AppError::Unprocessable(m)) => m,
+            other => panic!("expected Unprocessable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_fee_requires_a_charge_type() {
+        let m = rejected(None);
+        assert!(m.contains("required") && m.contains("EXACT or CAP") && m.contains("TRANSPORT"));
+    }
+
+    #[test]
+    fn exact_and_cap_are_accepted() {
+        assert_eq!(
+            parse_new_fee_charge_type("T", Some(&json!("EXACT"))).unwrap(),
+            FeeChargeType::Exact
+        );
+        assert_eq!(
+            parse_new_fee_charge_type("T", Some(&json!("CAP"))).unwrap(),
+            FeeChargeType::Cap
+        );
+    }
+
+    #[test]
+    fn anything_else_is_unprocessable_and_never_inferred() {
+        for bad in [
+            json!(""),
+            json!("exact"),
+            json!("Cap"),
+            json!(" EXACT"),
+            json!("EXACT "),
+            json!("MAX"),
+            json!("FIXED"),
+            json!("NULL"),
+            json!(5),
+            json!(true),
+            json!(["EXACT"]),
+            json!({ "type": "EXACT" }),
+        ] {
+            assert!(
+                rejected(Some(&bad)).contains("EXACT or CAP"),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_null_charge_type_deserialises_as_absent_so_it_is_rejected_not_defaulted() {
+        let missing: NewFee =
+            serde_json::from_value(json!({ "fee_code": "TRANSPORT", "amount": "500.00" })).unwrap();
+        assert!(missing.charge_type.is_none());
+        let null: NewFee = serde_json::from_value(
+            json!({ "fee_code": "TRANSPORT", "amount": "500.00", "charge_type": null }),
+        )
+        .unwrap();
+        assert!(null.charge_type.is_none());
+        let set: NewFee = serde_json::from_value(
+            json!({ "fee_code": "TRANSPORT", "amount": "500.00", "charge_type": "CAP" }),
+        )
+        .unwrap();
+        assert_eq!(set.charge_type, Some(json!("CAP")));
+    }
+
+    #[test]
+    fn classify_body_requires_a_type_and_rejects_unknown_fields() {
+        let none: ClassifyFee = serde_json::from_value(json!({})).unwrap();
+        assert!(none.charge_type.is_none());
+        let null: ClassifyFee = serde_json::from_value(json!({ "charge_type": null })).unwrap();
+        assert!(null.charge_type.is_none());
+        let cap: ClassifyFee = serde_json::from_value(json!({ "charge_type": "CAP" })).unwrap();
+        assert_eq!(cap.charge_type, Some(json!("CAP")));
+        assert!(serde_json::from_value::<ClassifyFee>(
+            json!({ "charge_type": "CAP", "fee_code": "X" })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn new_fee_still_rejects_unknown_fields() {
+        let r = serde_json::from_value::<NewFee>(json!({
+            "fee_code": "TRANSPORT", "amount": "500.00", "charge_type": "EXACT", "charge_type_set_by": "x"
+        }));
+        assert!(r.is_err());
+    }
 }

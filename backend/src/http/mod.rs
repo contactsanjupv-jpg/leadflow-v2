@@ -56,6 +56,10 @@ pub fn build_router_with_cors(state: AppState, cors_origins: &[String]) -> Route
         .route("/api/v1/contracts/:id/rates", post(data::create_rate))
         .route("/api/v1/rates/:id/end", put(data::end_rate))
         .route(
+            "/api/v1/rates/:rate_id/fees/:fee_code/type",
+            put(data::classify_fee),
+        )
+        .route(
             "/api/v1/invoices",
             get(data::list_invoices).post(data::create_invoice),
         )

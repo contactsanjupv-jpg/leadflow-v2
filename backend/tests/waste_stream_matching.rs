@@ -50,7 +50,7 @@ async fn add_rate(
         json!({
             "waste_stream": stream, "unit": "drum", "unit_rate": unit_rate,
             "effective_from": from, "effective_to": to, "facility_id": facility,
-            "authorized_fees": [{ "fee_code": "TRANSPORT", "amount": "500.00" }]
+            "authorized_fees": [{ "fee_code": "TRANSPORT", "amount": "500.00", "charge_type": "EXACT" }]
         }),
     )
     .await
@@ -689,7 +689,7 @@ async fn padded_legacy_rate_inserted_directly_matches_an_uppercase_invoice() {
     )
     .bind(org.organization_id).bind(contract_id).bind(vendor_id).bind(padded)
     .fetch_one(&mut *tx).await.unwrap();
-    sqlx::query("INSERT INTO contract_authorized_fees (contract_rate_id, fee_code, amount) VALUES ($1, 'TRANSPORT', 500.00)")
+    sqlx::query("INSERT INTO contract_authorized_fees (contract_rate_id, fee_code, amount, charge_type, charge_type_set_at) VALUES ($1, 'TRANSPORT', 500.00, 'EXACT', now())")
         .bind(rate_id).execute(&mut *tx).await.unwrap();
     let (stored, key): (String, Option<String>) =
         sqlx::query_as("SELECT waste_stream, waste_stream_key FROM contract_rates WHERE id = $1")

@@ -6,6 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import { chromium as pw } from "playwright-core";
 import chromiumBinary from "@sparticuz/chromium";
 
@@ -22,6 +23,28 @@ window.Paddle = {
   Initialize(o) { window.__paddle.init = o; },
   Checkout: { open(o) { window.__paddle.opened = o; } },
 };`;
+
+// Legacy authorized fees (charge_type NULL) predate charge types and can no longer be created through
+// the API, so exercising the classify UI needs ONE controlled SQL fixture. It runs as the same
+// least-privilege role the API uses (RLS applies, hence the org id), only against a database whose
+// name says e2e/test, and every interpolated value is validated first.
+function insertLegacyFee(orgId, rateId, feeCode, amount) {
+  const url = process.env.DATABASE_URL;
+  assert.ok(url, "DATABASE_URL is required for the legacy-fee fixture (scripts/e2e.sh already requires it)");
+  const dbName = new URL(url).pathname.replace(/^\//, "");
+  assert.match(dbName, /e2e|test/i, `refusing to write a fixture into database "${dbName}"`);
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  assert.match(orgId, uuid); assert.match(rateId, uuid);
+  assert.match(feeCode, /^[A-Z_]+$/); assert.match(amount, /^\d+(\.\d{1,4})?$/);
+  const sql = `BEGIN; SELECT set_config('app.current_org_id', '${orgId}', true); ` +
+    `INSERT INTO contract_authorized_fees (contract_rate_id, fee_code, description, amount) ` +
+    `VALUES ('${rateId}', '${feeCode}', 'Legacy fee (no charge type)', ${amount}); COMMIT;`;
+  try {
+    execFileSync("psql", [url, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql], { stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    throw new Error(`legacy-fee fixture failed (needs a psql client and a migrated e2e database): ${String(e.stderr || e.message).replaceAll(url, "<DATABASE_URL>")}`);
+  }
+}
 
 function signedHeader(body) {
   const ts = Math.floor(Date.now() / 1000);
@@ -144,9 +167,69 @@ test("critical customer workflow", async (t) => {
       await rates.getByRole("button", { name: "Add authorized fee" }).click();
       await fillLabel(rates, "Fee code", "TRANSPORT");
       await fillLabel(rates, "Amount", "500.00");
+      // The charge type is required and never preselected: the form must refuse to save without it.
+      const feeType = rates.locator("form").getByLabel("Charge type");
+      assert.equal(await feeType.inputValue(), "");
+      await rates.getByRole("button", { name: "Save rate" }).click();
+      assert.equal(await feeType.evaluate((el) => el.validity.valueMissing), true);
+      assert.equal(await rates.getByText("$400.00").count(), 0, "no rate may be saved without a charge type");
+      await feeType.selectOption("EXACT");
       await rates.getByRole("button", { name: "Save rate" }).click();
       await rates.getByText("$400.00").waitFor();
       await rates.getByText("TRANSPORT").waitFor();
+      await rates.locator("li", { hasText: "TRANSPORT" }).getByText("Exact", { exact: true }).waitFor();
+    });
+
+    await step("classify a legacy (charge_type NULL) fee in the UI: confirmation, resulting type, immutability", async () => {
+      const json = (path) => page.evaluate((p) => fetch(`/api/proxy${p}`).then((r) => r.json()), path);
+      const me = await json("/me");
+      const contract = (await json("/contracts?limit=200")).find((c) => c.name === "Master Service Agreement");
+      const detail = () => json(`/contracts/${contract.id}`);
+      const feeType = async (code) => (await detail()).rates[0].authorized_fees.find((f) => f.fee_code === code).charge_type;
+      assert.equal(await feeType("TRANSPORT"), "EXACT", "the type chosen in the create form was saved");
+      insertLegacyFee(me.organization_id, (await detail()).rates[0].id, "FUEL_SURCHARGE", "75.00");
+      assert.equal(await feeType("FUEL_SURCHARGE"), null, "the fixture fee is unclassified");
+
+      await page.goto(`${WEB}/data`);
+      await page.getByRole("button", { name: "Contracts & rates" }).click();
+      const rates = card("Rates");
+      await rates.locator("select").first().selectOption(contract.id);
+      const li = rates.locator("li", { hasText: "FUEL_SURCHARGE" });
+      await li.getByText("Unclassified").waitFor();
+      await rates.getByText(/Some authorized fees are unclassified/).waitFor();
+      assert.equal(await li.getByRole("button", { name: "Classify FUEL_SURCHARGE" }).isDisabled(), true, "disabled until a type is chosen");
+
+      // Cancel at the confirmation changes nothing, in the UI or on the server.
+      await li.getByLabel("Charge type for FUEL_SURCHARGE").selectOption("CAP");
+      await li.getByRole("button", { name: "Classify FUEL_SURCHARGE" }).click();
+      await li.getByText("Permanently set to Cap?").waitFor();
+      await li.getByRole("button", { name: "Cancel classify FUEL_SURCHARGE" }).click();
+      assert.equal(await li.getByText("Permanently set to").count(), 0);
+      await li.getByText("Unclassified").waitFor();
+      assert.equal(await feeType("FUEL_SURCHARGE"), null);
+
+      // Confirm classifies: success message, badge, controls gone, and the server holds CAP.
+      await li.getByRole("button", { name: "Classify FUEL_SURCHARGE" }).click();
+      await li.getByRole("button", { name: "Confirm classify FUEL_SURCHARGE" }).click();
+      await page.getByText("Fee FUEL_SURCHARGE classified as Cap").waitFor();
+      await li.getByText("Cap", { exact: true }).waitFor();
+      assert.equal(await li.getByText("Unclassified").count(), 0);
+      assert.equal(await li.getByRole("button", { name: /Classify/ }).count(), 0);
+      assert.equal(await feeType("FUEL_SURCHARGE"), "CAP");
+      assert.equal(await feeType("TRANSPORT"), "EXACT", "other fees are untouched");
+
+      // A classified fee is immutable: a second attempt is a 409 and the type does not change.
+      // (Sent through the browser context's request API: same session cookies and a same-origin Origin
+      // header for the proxy's CSRF check, but it does not log the expected 409 as a page console error,
+      // so the end-of-test console check stays strict.)
+      const again = await page.request.put(`${WEB}/api/proxy/rates/${(await detail()).rates[0].id}/fees/FUEL_SURCHARGE/type`, { data: { charge_type: "EXACT" }, headers: { origin: WEB } });
+      assert.equal(again.status(), 409);
+      assert.match((await again.json()).error.message, /already classified as CAP/);
+      assert.equal(await feeType("FUEL_SURCHARGE"), "CAP");
+
+      // The change is audited.
+      const audit = await json("/audit");
+      assert.ok(audit.some((a) => a.action === "contract_authorized_fee.classify" && a.after_state?.charge_type === "CAP"), "classification audit record");
     });
 
     await step("enter manifest and weight ticket", async () => {
