@@ -284,17 +284,45 @@ async fn classify(
     .await
 }
 
+/// Run the monitoring worker for `org` and return only once none of THAT organization's jobs is still
+/// pending or running.
+///
+/// The job queue is global: `run_one_job` claims the oldest job of ANY organization, and anything else
+/// using the same database (another test process, `cargo nextest`, a running server's worker) can claim,
+/// and be part-way through, THIS test's job. "Nothing left to claim" then does not mean "my job is
+/// done", and returning at that point lets the caller assert before the work has finished. Waiting for
+/// the organization's own jobs is correct whoever ends up executing them.
 async fn drain_worker(app: &TestApp, org: &TestOrg) {
     app.post("/api/v1/monitoring/run", &org.token, json!({}))
         .await;
-    for _ in 0..200 {
-        if !xflow_backend::workers::run_one_job(&app.pool, false)
-            .await
-            .unwrap()
-        {
-            break;
+    for _ in 0..3000 {
+        for _ in 0..200 {
+            if !xflow_backend::workers::run_one_job(&app.pool, false)
+                .await
+                .unwrap()
+            {
+                break;
+            }
         }
+        if active_jobs(app, org).await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    panic!("the monitoring jobs of the organization never finished");
+}
+
+async fn active_jobs(app: &TestApp, org: &TestOrg) -> i64 {
+    let mut tx = xflow_backend::tenants::begin_scoped_tx(&app.pool, org.organization_id)
+        .await
+        .unwrap();
+    sqlx::query_scalar(
+        "SELECT count(*) FROM monitoring_jobs WHERE organization_id = $1 AND status IN ('PENDING', 'RUNNING')",
+    )
+    .bind(org.organization_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap()
 }
 
 fn assert_422_envelope(status: StatusCode, body: &Value, ctx: &str) {

@@ -386,6 +386,32 @@ pub async fn classify_fee(
             "authorized fee '{fee_code}' was classified by another request"
         ))
     })?;
+    // Make every invoice this fee can price reconcile again. The request is written in THIS
+    // transaction, so it commits (or rolls back) together with the classification: there is no state
+    // where the fee is classified but nobody has been asked to re-reconcile. It does not depend on
+    // timestamp ordering, which is what let a classification that raced a reconciliation go unnoticed.
+    // Scope: same tenant, vendor and waste stream; the rate's effective window covers the service date;
+    // the rate applies to the invoice's facility; and the invoice actually bills this fee code.
+    sqlx::query(
+        "INSERT INTO invoice_reconciliation_requests (organization_id, invoice_id, reason, source_fee_id, requested_by)
+         SELECT cr.organization_id, i.id, 'FEE_CLASSIFIED', f.id, $2
+           FROM contract_authorized_fees f
+           JOIN contract_rates cr ON cr.id = f.contract_rate_id
+           JOIN invoices i ON i.organization_id = cr.organization_id
+                          AND i.vendor_id = cr.vendor_id
+                          AND i.waste_stream_key = cr.waste_stream_key
+                          AND i.service_date >= cr.effective_from
+                          AND (cr.effective_to IS NULL OR i.service_date <= cr.effective_to)
+                          AND (cr.facility_id IS NULL OR cr.facility_id = i.facility_id)
+          WHERE f.id = $1
+            AND EXISTS (SELECT 1 FROM invoice_line_items li
+                         WHERE li.invoice_id = i.id AND li.fee_code IS NOT NULL
+                           AND upper(btrim(li.fee_code)) = upper(btrim(f.fee_code)))",
+    )
+    .bind(fee_id)
+    .bind(user.user_id)
+    .execute(&mut *tx)
+    .await?;
     audit::record(
         &mut tx,
         user.organization_id,

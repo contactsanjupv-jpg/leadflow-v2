@@ -146,6 +146,17 @@ pub async fn run_for_invoice(
     organization_id: Uuid,
     invoice_id: Uuid,
 ) -> Result<RunOutcome, AppError> {
+    // Consume pending re-reconciliation requests FIRST, before anything below reads a fee, a rate or
+    // the invoice. In READ COMMITTED this DELETE sees exactly the requests committed before it; every
+    // later statement in this transaction sees at least the data those requests were about. A request
+    // committed after this statement (a classification that races this reconciliation) is untouched
+    // and survives our commit, so the worker reconciles the invoice again. If this transaction rolls
+    // back, the DELETE rolls back too and the request is not lost.
+    sqlx::query("DELETE FROM invoice_reconciliation_requests WHERE invoice_id = $1")
+        .bind(invoice_id)
+        .execute(&mut **tx)
+        .await?;
+
     let inv: InvoiceRow = sqlx::query_as(
         "SELECT id, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total, source_document_id, manifest_id
          FROM invoices WHERE id = $1",

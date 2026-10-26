@@ -35,7 +35,7 @@ SELECT o.name AS organization, v.name AS vendor, i.invoice_number, i.service_dat
 Handling:
 1. List the fees with the first query and decide EXACT or CAP for each with the contract owner.
 2. Classify each one with `PUT /rates/:rate_id/fees/:fee_code/type` (see `api.md`; needs `ManageData`). A classified fee cannot be changed; a mistake needs a new rate version (end the rate with `PUT /rates/:id/end` and add a replacement rate with the correct types), and past reconciliations are not rewritten.
-3. The next monitoring run re-reconciles each affected invoice once (an invoice already current is skipped). To re-run sooner, enqueue `POST /monitoring/run` or call `POST /reconciliations/run` for the invoice, then re-run the second query: invoices that now price completely disappear from it. Invoices with a RULE_11 conflict stay listed until the conflicting authorizations are resolved with a corrected rate version.
+3. Classification records a re-reconciliation request for each affected invoice (same transaction, so it cannot be lost), and the next monitoring run re-reconciles each such invoice once (an invoice already current is skipped; concurrent runs do not duplicate the work). To re-run sooner, enqueue `POST /monitoring/run` or call `POST /reconciliations/run` for the invoice, then re-run the second query: invoices that now price completely disappear from it. Invoices with a RULE_11 conflict stay listed until the conflicting authorizations are resolved with a corrected rate version.
 4. Verify and audit a classification:
 ```sql
 SELECT fee_code, charge_type, charge_type_set_at, charge_type_set_by
@@ -45,4 +45,12 @@ SELECT created_at, actor_user_id, before_state, after_state
 ```
 The demo seed (`scripts/seed_demo.sql`) inserts its fee without a type, so demo invoices reconcile as `PARTIAL` until that fee is classified.
 
-Known limitation: if a reconciliation was running at the moment a fee was classified, the worker may not notice that classification (see "Classification timing race" in `reconciliation.md`). Re-run the invoice with `POST /reconciliations/run` if an invoice still shows a RULE_12 finding after its fee was classified.
+Pending re-reconciliation requests (classifications the worker has not yet acted on). Normally empty within a monitoring cycle; a row that stays for long means the worker is not running, the organization is not entitled, or reconciling that invoice keeps failing:
+```sql
+SELECT o.name AS organization, i.invoice_number, q.reason, q.source_fee_id, q.requested_by, q.created_at
+  FROM invoice_reconciliation_requests q
+  JOIN invoices i ON i.id = q.invoice_id
+  JOIN organizations o ON o.id = q.organization_id
+ ORDER BY q.created_at;
+```
+Fees classified by direct SQL create no request and no audit record, so they are not picked up automatically; classify only through the endpoint.

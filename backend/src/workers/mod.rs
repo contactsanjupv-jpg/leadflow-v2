@@ -34,33 +34,54 @@ pub async fn enqueue_reconcile_pending(
     Ok(n > 0)
 }
 
-/// Invoices that have never been reconciled, or whose inputs (invoice, rate, authorized-fee
-/// classification, manifest, weight tickets) changed after their latest reconciliation.
-/// Already-current invoices are skipped, so repeated monitoring never churns the review queue.
+/// An invoice is stale when it has never been reconciled, an input (invoice, rate, authorized-fee
+/// classification, manifest, weight tickets) changed after its latest reconciliation, or a durable
+/// re-reconciliation request is pending. Already-current invoices are skipped, so repeated monitoring
+/// never churns the review queue, and earlier reconciliations and evidence snapshots are never rewritten.
 ///
-/// An authorized fee is classified (EXACT/CAP) after the fact through the classify endpoint, which
-/// stamps `charge_type_set_at`; the rate row itself does not change, so the rate clause alone would
-/// not notice it. Like the rate clause, the fee clause matches on vendor and waste-stream key. The
-/// comparison is strictly "newer than the latest reconciliation", so one re-run makes the invoice
-/// current again, and earlier reconciliations and evidence snapshots are never rewritten.
+/// An authorized fee is classified (EXACT/CAP) after the fact through the classify endpoint; the rate
+/// row itself does not change, so the rate clause alone would not notice it. The endpoint therefore
+/// writes a request row in the same transaction as the classification (migration 0012), and the request
+/// clause below is what makes a classification impossible to miss: it does not depend on comparing
+/// timestamps, which `now()` (fixed at transaction start) can order the wrong way when a classification
+/// races a reconciliation. It also replaces the earlier `charge_type_set_at > latest reconciliation`
+/// comparison, which was both race-prone and too broad (it ignored the rate's effective window and
+/// whether the invoice bills the fee). Requests are scoped by the classify endpoint to the invoices the
+/// fee can actually price.
+const STALE_INVOICE_SELECT: &str = r#"SELECT i.id FROM invoices i
+           LEFT JOIN LATERAL (SELECT created_at FROM reconciliations r WHERE r.invoice_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1) lr ON true
+           WHERE "#;
+const STALE_INVOICE_PREDICATE: &str = r#"(lr.created_at IS NULL
+              OR EXISTS (SELECT 1 FROM invoice_reconciliation_requests q WHERE q.invoice_id = i.id)
+              OR i.updated_at > lr.created_at
+              OR EXISTS (SELECT 1 FROM contract_rates cr WHERE cr.vendor_id = i.vendor_id AND cr.waste_stream_key = i.waste_stream_key AND cr.created_at > lr.created_at)
+              OR EXISTS (SELECT 1 FROM manifests m WHERE m.id = i.manifest_id AND m.created_at > lr.created_at)
+              OR EXISTS (SELECT 1 FROM weight_records w WHERE w.manifest_id = i.manifest_id AND w.created_at > lr.created_at))"#;
+
+/// The ids of stale invoices (see [`STALE_INVOICE_PREDICATE`]), oldest first.
 pub async fn invoices_needing_reconciliation(
     tx: &mut Transaction<'_, Postgres>,
     limit: i64,
 ) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        r#"SELECT i.id FROM invoices i
-           LEFT JOIN LATERAL (SELECT created_at FROM reconciliations r WHERE r.invoice_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1) lr ON true
-           WHERE lr.created_at IS NULL
-              OR i.updated_at > lr.created_at
-              OR EXISTS (SELECT 1 FROM contract_rates cr WHERE cr.vendor_id = i.vendor_id AND cr.waste_stream_key = i.waste_stream_key AND cr.created_at > lr.created_at)
-              OR EXISTS (SELECT 1 FROM contract_rates cr JOIN contract_authorized_fees f ON f.contract_rate_id = cr.id WHERE cr.vendor_id = i.vendor_id AND cr.waste_stream_key = i.waste_stream_key AND f.charge_type_set_at > lr.created_at)
-              OR EXISTS (SELECT 1 FROM manifests m WHERE m.id = i.manifest_id AND m.created_at > lr.created_at)
-              OR EXISTS (SELECT 1 FROM weight_records w WHERE w.manifest_id = i.manifest_id AND w.created_at > lr.created_at)
-           ORDER BY i.created_at LIMIT $1"#,
-    )
-    .bind(limit)
-    .fetch_all(&mut **tx)
-    .await
+    let sql =
+        format!("{STALE_INVOICE_SELECT}{STALE_INVOICE_PREDICATE} ORDER BY i.created_at LIMIT $1");
+    sqlx::query_scalar(&sql)
+        .bind(limit)
+        .fetch_all(&mut **tx)
+        .await
+}
+
+/// Is this one invoice still stale? Used under a per-invoice lock to skip work another pass just did.
+async fn invoice_needs_reconciliation(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let sql = format!("{STALE_INVOICE_SELECT}i.id = $1 AND {STALE_INVOICE_PREDICATE}");
+    Ok(sqlx::query_scalar::<_, Uuid>(&sql)
+        .bind(invoice_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some())
 }
 
 /// Execute one RECONCILE_PENDING job for an organization. Returns the number of invoices processed.
@@ -83,6 +104,17 @@ pub async fn run_reconcile_pending(
     let mut incomplete_pricing_invoice_count = 0usize;
     for id in &ids {
         let mut tx = crate::tenants::begin_scoped_tx(pool, organization_id).await?;
+        // Serialise passes per invoice and re-check under the lock: a concurrent pass (or a manual run)
+        // may have reconciled this invoice since the list above was built. The lock is released at
+        // commit/rollback, and the re-check sees everything that pass committed.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if !invoice_needs_reconciliation(&mut tx, *id).await? {
+            tx.rollback().await?;
+            continue;
+        }
         let outcome = service::run_for_invoice(&mut tx, organization_id, *id).await?;
         crate::audit::record(&mut tx, organization_id, None, "reconciliation.run", "reconciliation", Some(outcome.reconciliation_id), None,
             Some(serde_json::json!({ "invoice_id": id, "trigger": "monitoring", "discrepancy_count": outcome.discrepancy_ids.len() }))).await?;
