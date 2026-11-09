@@ -200,6 +200,81 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
              JOIN contract_rates cr ON cr.id = lr.contract_rate_id
             WHERE lr.reconciliation_id = $1) p",
     ).bind(rec_id).fetch_one(&mut **tx).await?;
+    // Every rate the engine considered applicable in THIS reconciliation (one per unit), including a
+    // rate that priced no line, because fees are evaluated against all of them. Whether that set was
+    // recorded is an explicit fact of the reconciliation (`applicable_rates_recorded`), NOT inferred from
+    // the rows: a reconciliation can legitimately have an empty set and it is still recorded. Only
+    // reconciliations made before migration 0013 are not: for those, fall back to the rates found in
+    // their persisted line-rate rows (plus the parent rate) and say so. (A reconciliation from between
+    // 0013 and 0014 has rate rows, which prove it was recorded.) No parent rate is ever invented, and
+    // `contract_rate` above stays exactly what the reconciliation stored.
+    let snapshot_recorded: bool =
+        sqlx::query_scalar("SELECT applicable_rates_recorded FROM reconciliations WHERE id = $1")
+            .bind(rec_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let recorded_rate_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT contract_rate_id FROM reconciliation_applicable_rates WHERE reconciliation_id = $1",
+    )
+    .bind(rec_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let (applicable_rates_basis, applicable_rate_ids): (&str, Vec<Uuid>) = if snapshot_recorded
+        || !recorded_rate_ids.is_empty()
+    {
+        ("recorded", recorded_rate_ids)
+    } else {
+        let fallback: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT contract_rate_id FROM reconciliation_line_rates WHERE reconciliation_id = $1
+             UNION SELECT contract_rate_id FROM reconciliations WHERE id = $1 AND contract_rate_id IS NOT NULL",
+        )
+        .bind(rec_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        if fallback.is_empty() {
+            ("none", fallback)
+        } else {
+            ("line_rates_only", fallback)
+        }
+    };
+    let applicable_rates: Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(to_jsonb(x) ORDER BY x.unit, x.effective_from, x.contract_rate_id), '[]'::jsonb) FROM (
+           SELECT cr.id AS contract_rate_id, cr.contract_id, (SELECT name FROM contracts WHERE id = cr.contract_id) AS contract_name,
+                  (SELECT source_document_id FROM contracts WHERE id = cr.contract_id) AS contract_source_document_id,
+                  cr.facility_id, cr.waste_stream, cr.unit, cr.unit_rate::text AS unit_rate, cr.effective_from, cr.effective_to,
+                  (SELECT coalesce(jsonb_agg(jsonb_build_object('fee_code', f.fee_code, 'description', f.description, 'amount', f.amount::text, 'charge_type', f.charge_type) ORDER BY f.fee_code), '[]'::jsonb)
+                     FROM contract_authorized_fees f WHERE f.contract_rate_id = cr.id) AS authorized_fees,
+                  (SELECT coalesce(jsonb_agg(lr.invoice_line_item_id ORDER BY lr.invoice_line_item_id), '[]'::jsonb)
+                     FROM reconciliation_line_rates lr WHERE lr.reconciliation_id = $1 AND lr.contract_rate_id = cr.id) AS priced_line_ids
+             FROM contract_rates cr WHERE cr.id = ANY($2)) x",
+    )
+    .bind(rec_id)
+    .bind(&applicable_rate_ids)
+    .fetch_one(&mut **tx)
+    .await?;
+    // Per invoice line that bills a fee: what the applicable rates authorize for that fee code and which
+    // rate (if any) the reconciliation priced the line against. A line with no recorded rate is one the
+    // engine could not or did not price (not authorized, conflicting, unclassified, duplicate): the
+    // authorizations listed here, with their types as stored, are what it had to decide from.
+    let fee_lines: Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(jsonb_build_object(
+                  'invoice_line_item_id', l.id, 'description', l.description, 'fee_code', l.fee_code,
+                  'billed_amount', l.line_total::text,
+                  'priced_by_contract_rate_id', lr.contract_rate_id, 'expected_line_amount', lr.expected_line_amount::text,
+                  'authorizations', (SELECT coalesce(jsonb_agg(jsonb_build_object('contract_rate_id', f.contract_rate_id, 'fee_code', f.fee_code,
+                                       'amount', f.amount::text, 'charge_type', f.charge_type) ORDER BY f.contract_rate_id, f.fee_code), '[]'::jsonb)
+                                       FROM contract_authorized_fees f
+                                      WHERE f.contract_rate_id = ANY($2) AND upper(btrim(f.fee_code)) = upper(btrim(l.fee_code)))
+                ) ORDER BY l.id), '[]'::jsonb)
+           FROM invoice_line_items l
+           LEFT JOIN reconciliation_line_rates lr ON lr.reconciliation_id = $1 AND lr.invoice_line_item_id = l.id
+          WHERE l.invoice_id = $3 AND l.fee_code IS NOT NULL",
+    )
+    .bind(rec_id)
+    .bind(&applicable_rate_ids)
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?;
     let manifest: Option<Value> = sqlx::query_scalar(
         "SELECT to_jsonb(m) FROM (SELECT id, manifest_number, waste_stream, container_count, quantity::text AS quantity, unit, shipment_date, source_document_id FROM manifests WHERE id = (SELECT manifest_id FROM reconciliations WHERE id = $1)) m",
     ).bind(rec_id).fetch_optional(&mut **tx).await?;
@@ -221,6 +296,9 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
         "invoice": invoice,
         "contract_rate": rate,
         "priced_lines": priced_lines,
+        "applicable_rates_basis": applicable_rates_basis,
+        "applicable_rates": applicable_rates,
+        "fee_lines": fee_lines,
         "manifest": manifest,
         "weight_tickets": tickets,
         "source_documents": documents,

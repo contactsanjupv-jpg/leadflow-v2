@@ -1096,11 +1096,11 @@ async fn evidence_json_snapshot_and_pdf_agree_for_exact_cap_and_unclassified() {
 }
 
 #[tokio::test]
-async fn multi_rate_invoices_do_not_carry_parent_fee_types_into_evidence() {
-    // DOCUMENTED LIMITATION (out of scope, pinned so a change is deliberate): when several rates
-    // priced an invoice the reconciliation has no single parent rate, so evidence and the PDF print
-    // no authorized fees at all; priced_lines carries the rates instead. Fee types therefore only
-    // appear in evidence for single-rate invoices.
+async fn multi_rate_invoices_carry_each_rates_fee_types_into_evidence_without_a_parent_rate() {
+    // When several rates apply the reconciliation has no single parent rate and evidence never
+    // invents one (`contract_rate` stays null). Evidence and the PDF instead list every applicable
+    // rate with its authorized fees and their stored types (see tests/evidence_multi_rate.rs for the
+    // full matrix). This test used to pin the OPPOSITE: that the PDF printed no fee types here.
     let app = test_app().await;
     let org = app.signup_org("fee-multi").await;
     let (vendor_id, contract_id) = vendor_contract(&app, &org, "mr").await;
@@ -1136,11 +1136,16 @@ async fn multi_rate_invoices_do_not_carry_parent_fee_types_into_evidence() {
         ev["content"]["contract_rate"]
     );
     assert!(ev["content"]["priced_lines"].as_array().unwrap().len() >= 2);
+    // Both applicable rates are listed, each with the EXACT fee it authorizes.
+    let rates = ev["content"]["applicable_rates"].as_array().unwrap();
+    assert_eq!(rates.len(), 2);
+    for rate in rates {
+        assert_eq!(rate["authorized_fees"][0]["charge_type"], "EXACT", "{rate}");
+    }
     let pdf = fetch_pdf(&app, &org, &did).await;
-    assert!(
-        !pdf.contains("[exact charge]"),
-        "the PDF prints fees from the parent rate only"
-    );
+    assert!(pdf.contains("More than one contract rate applied"));
+    assert!(pdf.contains("Authorized fee: TRANSPORT - $500.00 [exact charge]"));
+    assert!(!pdf.contains("No contract rate covered"));
 }
 
 // ---------------------------------------------------------------------------------------------

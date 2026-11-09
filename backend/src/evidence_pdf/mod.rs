@@ -274,6 +274,144 @@ impl PdfBuilder {
     }
 }
 
+/// "Rate 2, ton" for the rate with this id among the applicable rates, so fee lines can point at the
+/// exact rate block above them without relying on the unit alone.
+fn rate_label(rates: &[Value], id: &str) -> String {
+    match rates.iter().position(|r| s(r, "contract_rate_id") == id) {
+        Some(i) => format!("Rate {}, {}", i + 1, s(&rates[i], "unit")),
+        None => "unknown rate".to_string(),
+    }
+}
+
+/// Contract terms for an invoice priced by several rates: every applicable rate with the lines it
+/// priced and its authorized fees (types exactly as stored; `null` reads "unclassified"), then, for
+/// each fee billed on the invoice, which rates authorize that fee code and what priced the line.
+fn render_applicable_rates(p: &mut PdfBuilder, content: &Value, rates: &[Value]) {
+    p.para(
+        "More than one contract rate applied to this invoice, one per unit, so no single rate priced the whole bill. Each applicable rate, the invoice lines it priced and its authorized fees are listed below.",
+        0,
+    );
+    if s(content, "applicable_rates_basis") == "line_rates_only" {
+        p.para(
+            "This reconciliation predates recording the full set of applicable rates, so only the rates that priced a line are listed. A rate that applied but priced no line may be missing.",
+            0,
+        );
+    }
+    let priced = content["priced_lines"].as_array();
+    for (i, rate) in rates.iter().enumerate() {
+        p.blank();
+        p.field(
+            &format!("Rate {}", i + 1),
+            &format!(
+                "{} / {} - {} per {}",
+                s(rate, "contract_name"),
+                s(rate, "waste_stream"),
+                money(s(rate, "unit_rate")),
+                s(rate, "unit")
+            ),
+        );
+        p.field(
+            "Effective",
+            &format!(
+                "{} to {}",
+                s(rate, "effective_from"),
+                if rate["effective_to"].is_null() {
+                    "open"
+                } else {
+                    s(rate, "effective_to")
+                }
+            ),
+        );
+        let line_ids = rate["priced_line_ids"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if line_ids.is_empty() {
+            p.field(
+                "Priced lines",
+                "none, this rate applied but priced no invoice line",
+            );
+        }
+        for id in line_ids.iter().filter_map(Value::as_str) {
+            let line = priced.and_then(|ls| ls.iter().find(|l| s(l, "invoice_line_item_id") == id));
+            match line {
+                Some(l) => p.field(
+                    "Priced line",
+                    &format!(
+                        "{} - expected {}",
+                        s(l, "description"),
+                        money(s(l, "expected_line_amount"))
+                    ),
+                ),
+                None => p.field("Priced line", id),
+            }
+        }
+        match rate["authorized_fees"].as_array() {
+            Some(fees) if !fees.is_empty() => {
+                for f in fees {
+                    p.field(
+                        "Authorized fee",
+                        &format!(
+                            "{} - {} [{}]",
+                            s(f, "fee_code"),
+                            money(s(f, "amount")),
+                            fee_charge_label(f)
+                        ),
+                    );
+                }
+            }
+            _ => p.para("No authorized fees are listed for this rate.", 0),
+        }
+    }
+    if let Some(fee_lines) = content["fee_lines"].as_array().filter(|l| !l.is_empty()) {
+        p.blank();
+        p.para("Fees billed on the invoice and what authorizes them:", 0);
+        for line in fee_lines {
+            p.field(
+                "Fee line",
+                &format!(
+                    "{} billed {}",
+                    s(line, "fee_code"),
+                    money(s(line, "billed_amount"))
+                ),
+            );
+            match line["authorizations"].as_array().filter(|a| !a.is_empty()) {
+                Some(auths) => {
+                    for a in auths {
+                        p.field(
+                            "  Authorized by",
+                            &format!(
+                                "{}: {} [{}]",
+                                rate_label(rates, s(a, "contract_rate_id")),
+                                money(s(a, "amount")),
+                                fee_charge_label(a)
+                            ),
+                        );
+                    }
+                }
+                None => p.field(
+                    "  Authorized by",
+                    "no applicable rate authorizes this fee code",
+                ),
+            }
+            match line["priced_by_contract_rate_id"].as_str() {
+                Some(id) => p.field(
+                    "  Priced against",
+                    &format!(
+                        "{}, expected {}",
+                        rate_label(rates, id),
+                        money(s(line, "expected_line_amount"))
+                    ),
+                ),
+                None => p.field(
+                    "  Priced against",
+                    "no rate, no expected amount was recorded for this line",
+                ),
+            }
+        }
+    }
+}
+
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
@@ -454,7 +592,16 @@ pub fn render(
     p.heading("4. Contract terms applied");
     let rate = &content["contract_rate"];
     if rate.is_null() {
-        p.para("No contract rate covered this invoice's service date.", 0);
+        // No single parent rate. When several rates applied, evidence carries each of them; never
+        // present one as the parent. Evidence stored before multi-rate support has no such list and
+        // keeps the original wording.
+        match content["applicable_rates"]
+            .as_array()
+            .filter(|r| !r.is_empty())
+        {
+            Some(rates) => render_applicable_rates(&mut p, content, rates),
+            None => p.para("No contract rate covered this invoice's service date.", 0),
+        }
     } else {
         p.field("Contract", s(rate, "contract_name"));
         p.field(
@@ -709,6 +856,92 @@ mod tests {
         }
     }
 
+    fn multi_rate_content(basis: &str) -> Value {
+        json!({
+            "discrepancy": { "invoice_number": "INV-M", "vendor_name": "Acme", "description": "d", "discrepancy_type": "UNAUTHORIZED_FEE", "rule_id": "R", "amount": "0.0000", "confidence": "High", "review_status": "NEW" },
+            "reconciliation": { "pricing_status": "PARTIAL", "invoiced_amount": "5600.0000", "identified_finding_amount": "0.0000", "engine_version": "1", "calculation_trace": [] },
+            "invoice": { "invoice_number": "INV-M", "invoice_date": "2026-03-15", "service_date": "2026-03-10", "waste_stream": "F003", "total": "5600.0000", "lines": [] },
+            "contract_rate": null,
+            "applicable_rates_basis": basis,
+            "applicable_rates": [
+                { "contract_rate_id": "r-drum", "contract_name": "Master", "waste_stream": "F003", "unit": "drum", "unit_rate": "400.0000", "effective_from": "2026-01-01", "effective_to": null,
+                  "priced_line_ids": ["l-drum"],
+                  "authorized_fees": [ { "fee_code": "TRANSPORT", "amount": "500.0000", "charge_type": "EXACT" } ] },
+                { "contract_rate_id": "r-ton", "contract_name": "Master", "waste_stream": "F003", "unit": "ton", "unit_rate": "1000.0000", "effective_from": "2026-01-01", "effective_to": "2026-12-31",
+                  "priced_line_ids": [],
+                  "authorized_fees": [ { "fee_code": "TRANSPORT", "amount": "600.0000", "charge_type": "CAP" },
+                                       { "fee_code": "ENV_FEE", "amount": "200.0000", "charge_type": null } ] }
+            ],
+            "priced_lines": [ { "invoice_line_item_id": "l-drum", "description": "Drum disposal", "expected_line_amount": "4000.0000" } ],
+            "fee_lines": [
+                { "invoice_line_item_id": "l-t", "description": "Transportation", "fee_code": "TRANSPORT", "billed_amount": "500.0000", "priced_by_contract_rate_id": null, "expected_line_amount": null,
+                  "authorizations": [ { "contract_rate_id": "r-drum", "amount": "500.0000", "charge_type": "EXACT" },
+                                      { "contract_rate_id": "r-ton", "amount": "600.0000", "charge_type": "CAP" } ] },
+                { "invoice_line_item_id": "l-e", "description": "Environmental", "fee_code": "ENV_FEE", "billed_amount": "200.0000", "priced_by_contract_rate_id": null, "expected_line_amount": null,
+                  "authorizations": [ { "contract_rate_id": "r-ton", "amount": "200.0000", "charge_type": null } ] },
+                { "invoice_line_item_id": "l-x", "description": "Misc", "fee_code": "MISC", "billed_amount": "10.0000", "priced_by_contract_rate_id": "r-drum", "expected_line_amount": "10.0000", "authorizations": [] }
+            ],
+            "manifest": null, "weight_tickets": [], "source_documents": []
+        })
+    }
+
+    #[test]
+    fn multi_rate_pdf_shows_every_rate_its_fees_and_what_authorizes_each_fee_line() {
+        let pdf = render("Org", "pkg", "2026-10-01", &multi_rate_content("recorded"));
+        let t = String::from_utf8_lossy(&pdf).to_string();
+        for needle in [
+            "More than one contract rate applied",
+            "Rate 1: Master / F003 - $400.00 per drum",
+            "Rate 2: Master / F003 - $1,000.00 per ton",
+            "Priced line: Drum disposal - expected $4,000.00",
+            "Priced lines: none, this rate applied but priced no invoice line",
+            "Authorized fee: TRANSPORT - $500.00 [exact charge]",
+            "Authorized fee: TRANSPORT - $600.00 [cap: maximum allowed]",
+            "Authorized fee: ENV_FEE - $200.00 [unclassified: type not set]",
+            "Fee line: TRANSPORT billed $500.00",
+            "Authorized by: Rate 1, drum: $500.00 [exact charge]",
+            "Authorized by: Rate 2, ton: $600.00 [cap: maximum allowed]",
+            "Authorized by: Rate 2, ton: $200.00 [unclassified: type not set]",
+            "Priced against: no rate, no expected amount was recorded",
+            "Authorized by: no applicable rate authorizes this fee code",
+            "Priced against: Rate 1, drum, expected $10.00",
+        ] {
+            assert!(t.contains(needle), "PDF text is missing {needle:?}");
+        }
+        assert!(
+            !t.contains("No contract rate covered"),
+            "a multi-rate invoice must not claim no rate applied"
+        );
+        assert!(
+            !t.contains("predates recording"),
+            "recorded evidence carries no fallback note"
+        );
+    }
+
+    #[test]
+    fn evidence_without_the_full_rate_set_says_so_and_old_packages_keep_their_wording() {
+        let t = String::from_utf8_lossy(&render(
+            "Org",
+            "pkg",
+            "2026-10-01",
+            &multi_rate_content("line_rates_only"),
+        ))
+        .to_string();
+        assert!(t.contains("predates recording the full set of applicable rates"));
+
+        // An evidence package stored before multi-rate support: no applicable_rates key at all.
+        let mut old = multi_rate_content("recorded");
+        for k in ["applicable_rates", "applicable_rates_basis", "fee_lines"] {
+            old.as_object_mut().unwrap().remove(k);
+        }
+        let t = String::from_utf8_lossy(&render("Org", "pkg", "2026-10-01", &old)).to_string();
+        assert!(
+            t.contains("No contract rate covered"),
+            "old packages render exactly as before"
+        );
+        assert!(!t.contains("Rate 1:"));
+    }
+
     #[test]
     fn incomplete_pricing_is_labeled_and_partial_subtotal_is_not_full_expected_amount() {
         let content = json!({
@@ -725,7 +958,6 @@ mod tests {
         assert!(rendered.contains("Partial expected subtotal"));
         assert!(rendered.contains("Not computed / not verified"));
     }
-
 
     #[test]
     fn legacy_pricing_hides_historical_totals_and_warns_the_reader() {
@@ -776,5 +1008,4 @@ mod tests {
         assert!(!rendered.contains("$4,500.00"));
         assert!(!rendered.contains("$700.00"));
     }
-
 }

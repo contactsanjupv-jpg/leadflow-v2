@@ -443,8 +443,8 @@ pub async fn run_for_invoice(
 
         let reconciliation_id: Uuid = sqlx::query_scalar(
         "INSERT INTO reconciliations
-           (organization_id, invoice_id, contract_rate_id, manifest_id, weight_record_id, expected_amount, invoiced_amount, discrepancy_amount, pricing_status, partial_expected_amount, identified_finding_amount, review_status, tolerances_applied, calculation_trace)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::review_status, $13, $14) RETURNING id",
+           (organization_id, invoice_id, contract_rate_id, manifest_id, weight_record_id, expected_amount, invoiced_amount, discrepancy_amount, pricing_status, partial_expected_amount, identified_finding_amount, review_status, tolerances_applied, calculation_trace, applicable_rates_recorded)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::review_status, $13, $14, true) RETURNING id",
     )
     .bind(organization_id)
     .bind(invoice_id)
@@ -466,6 +466,24 @@ pub async fn run_for_invoice(
     .bind(serde_json::to_value(&result.calculation_trace).map_err(|e| AppError::Internal(e.into()))?)
     .fetch_one(&mut **tx)
     .await?;
+
+    // The rates the engine evaluated (including any that priced no line), so evidence can show every
+    // authorization that contributed to the result. Written with the reconciliation, in this transaction.
+    // The reconciliation row itself says (applicable_rates_recorded = true, set by its INSERT above) that
+    // this set was recorded, so an EMPTY set (no rate covered the service date) is still a recorded fact.
+    for rate in &input.applicable_rates {
+        sqlx::query(
+            "INSERT INTO reconciliation_applicable_rates
+               (organization_id, reconciliation_id, invoice_id, contract_rate_id)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(organization_id)
+        .bind(reconciliation_id)
+        .bind(input.invoice.id)
+        .bind(rate.id)
+        .execute(&mut **tx)
+        .await?;
+    }
 
     for priced in &result.priced_lines {
         sqlx::query(
