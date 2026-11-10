@@ -287,7 +287,8 @@ async fn build_evidence(tx: &mut Tx, discrepancy_id: Uuid) -> Result<Value, AppE
             SELECT source_document_id FROM invoices WHERE id = $1 UNION SELECT source_document_id FROM manifests WHERE id = (SELECT manifest_id FROM reconciliations WHERE id = $2)
             UNION SELECT source_document_id FROM weight_records WHERE manifest_id = (SELECT manifest_id FROM reconciliations WHERE id = $2)
             UNION SELECT source_document_id FROM contracts WHERE id = (SELECT contract_id FROM contract_rates WHERE id = (SELECT contract_rate_id FROM reconciliations WHERE id = $2))
-            UNION SELECT source_document_id FROM contracts WHERE id IN (SELECT cr.contract_id FROM reconciliation_line_rates lr JOIN contract_rates cr ON cr.id = lr.contract_rate_id WHERE lr.reconciliation_id = $2))) d",
+            UNION SELECT source_document_id FROM contracts WHERE id IN (SELECT cr.contract_id FROM reconciliation_line_rates lr JOIN contract_rates cr ON cr.id = lr.contract_rate_id WHERE lr.reconciliation_id = $2)
+            UNION SELECT source_document_id FROM contracts WHERE id IN (SELECT cr.contract_id FROM reconciliation_applicable_rates ar JOIN contract_rates cr ON cr.id = ar.contract_rate_id WHERE ar.reconciliation_id = $2))) d",
     ).bind(invoice_id).bind(rec_id).fetch_one(&mut **tx).await?;
     Ok(json!({
         "format_version": 1,

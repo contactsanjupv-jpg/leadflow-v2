@@ -39,7 +39,6 @@ struct Fee {
 }
 
 struct Multi {
-    contract_id: String,
     drum_rate: String,
     ton_rate: String,
     invoice_id: String,
@@ -135,7 +134,6 @@ async fn multi(
         "waste_stream": "F003", "total": format!("{total:.2}"), "line_items": lines
     })).await;
     Multi {
-        contract_id,
         drum_rate,
         ton_rate,
         invoice_id: invoice["id"].as_str().unwrap().to_string(),
@@ -1211,5 +1209,92 @@ async fn every_new_reconciliation_is_marked_and_the_marker_commits_with_its_rows
         )
         .await,
         rows_before
+    );
+}
+
+/// The evidence's `source_documents` must cite the contract document behind EVERY rate in the recorded
+/// applicable set, because `applicable_rates[].contract_source_document_id` points at it. A rate that
+/// priced no invoice line (the ton rate here, on a different contract) used to be left out.
+#[tokio::test]
+async fn source_documents_include_the_contract_of_an_applicable_rate_that_priced_no_line() {
+    let app = test_app().await;
+    let org = app.signup_org("srcdocs").await;
+
+    // Two contract documents with different bytes (uploads are de-duplicated by content hash).
+    let mut docs: Vec<String> = Vec::new();
+    for name in ["drum", "ton"] {
+        let (st, _h, bytes) = app
+            .call_raw(
+                Method::POST,
+                &format!("/api/v1/documents?document_type=CONTRACT&filename={name}-contract.txt"),
+                Some(&org.token),
+                Some("text/plain"),
+                format!("{name} contract {}", Uuid::new_v4()).into_bytes(),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{}", String::from_utf8_lossy(&bytes));
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        docs.push(v["id"].as_str().unwrap().to_string());
+    }
+
+    let vendor = ok(&app, &org, "/api/v1/vendors", json!({ "name": "Vendor SRCDOCS" })).await;
+    let vendor_id = vendor["id"].as_str().unwrap().to_string();
+    let drum_contract = ok(
+        &app,
+        &org,
+        "/api/v1/contracts",
+        json!({ "vendor_id": vendor_id, "name": "Drum contract", "source_document_id": docs[0] }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ton_contract = ok(
+        &app,
+        &org,
+        "/api/v1/contracts",
+        json!({ "vendor_id": vendor_id, "name": "Ton contract", "source_document_id": docs[1] }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let drum_rate = make_rate(&app, &org, &drum_contract, "drum", "400.00", &[]).await;
+    let ton_rate = make_rate(&app, &org, &ton_contract, "ton", "1000.00", &[]).await;
+
+    // Only drums and an unauthorized fee are billed, so the ton rate applies but prices no line.
+    let invoice = ok(&app, &org, "/api/v1/invoices", json!({
+        "vendor_id": vendor_id, "invoice_number": "INV-SRCDOCS", "invoice_date": "2026-03-15", "service_date": "2026-03-10",
+        "waste_stream": "F003", "total": "4600.00",
+        "line_items": [
+            { "description": "Drum disposal", "quantity": "10", "unit": "drum", "unit_price": "400.00", "line_total": "4000.00" },
+            { "description": "Fee TRANSPORT", "fee_code": "TRANSPORT", "quantity": "1", "unit": "flat", "unit_price": "600.00", "line_total": "600.00" }
+        ]
+    })).await;
+    let r = run(&app, &org, invoice["id"].as_str().unwrap()).await;
+    let did = discrepancy_id(&r, "RULE_04_UNAUTHORIZED_FEE");
+
+    let ev = evidence(&app, &org, &did).await;
+    let c = &ev["content"];
+    assert_eq!(c["applicable_rates_basis"], "recorded");
+    let ton = rate_by_unit(c, "ton");
+    assert_eq!(ton["contract_rate_id"], ton_rate);
+    assert!(
+        ton["priced_line_ids"].as_array().unwrap().is_empty(),
+        "the ton rate must have priced no line: {ton}"
+    );
+    assert_eq!(ton["contract_source_document_id"], docs[1]);
+    assert_eq!(rate_by_unit(c, "drum")["contract_rate_id"], drum_rate);
+
+    let cited: BTreeSet<String> = c["source_documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap().to_string())
+        .collect();
+    let expected: BTreeSet<String> = docs.iter().cloned().collect();
+    assert_eq!(
+        cited, expected,
+        "source_documents must hold the contract document of every applicable rate, including the one that priced no line"
     );
 }
