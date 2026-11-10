@@ -21,6 +21,9 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
 
+    // Tenant isolation depends on RLS; refuse a superuser / BYPASSRLS runtime role.
+    xflow_backend::common::db_role::assert_rls_enforced(&pool).await?;
+
     // Migrations are deliberately NOT run here (spec section 30): this pool connects as the
     // least-privilege `xflow_app` role, which correctly cannot CREATE/ALTER tables.
     // Run migrations via scripts/migrate.sh with a privileged role as a separate deploy step.
