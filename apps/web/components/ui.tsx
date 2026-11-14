@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api } from "@/lib/api";
 import { formatMoney } from "@/lib/money";
+import { createLoader } from "@/lib/latest-load";
 
 export function Money({ v }: { v: string | null | undefined }) {
   return <span className="num">{formatMoney(v)}</span>;
@@ -21,14 +22,13 @@ export function useLoad<T = any>(path: string | null) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // Latest-request-wins (see lib/latest-load.ts): a slow older response can never overwrite a newer one.
+  const [loader] = useState(() => createLoader<T>((p) => api<T>("GET", p), { data: (d) => setData(d), error: setError, loading: setLoading }));
   const reload = useCallback(async () => {
     if (!path) return;
-    setLoading(true);
-    try { setData(await api<T>("GET", path)); setError(null); }
-    catch (e: any) { setError(e.message ?? "Failed to load"); }
-    finally { setLoading(false); }
-  }, [path]);
-  useEffect(() => { void reload(); }, [reload]);
+    await loader.load(path);
+  }, [path, loader]);
+  useEffect(() => { void reload(); return () => loader.cancel(); }, [reload, loader]);
   return { data, error, loading, reload };
 }
 

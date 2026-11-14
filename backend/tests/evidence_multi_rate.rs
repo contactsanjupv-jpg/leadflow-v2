@@ -1298,3 +1298,90 @@ async fn source_documents_include_the_contract_of_an_applicable_rate_that_priced
         "source_documents must hold the contract document of every applicable rate, including the one that priced no line"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Document download (the review page links every source document through it) and retrieval of an
+// already-stored evidence package (the review page shows it read-only when a row is opened).
+// ---------------------------------------------------------------------------------------------
+
+/// Every document type an evidence package can cite as a source: the owner can download the exact bytes
+/// as an attachment; another organization, a missing token and a bogus token cannot.
+#[tokio::test]
+async fn source_document_downloads_are_authenticated_and_tenant_isolated_for_every_document_type() {
+    let app = test_app().await;
+    let a = app.signup_org("dl-a").await;
+    let b = app.signup_org("dl-b").await;
+
+    for doc_type in ["INVOICE", "CONTRACT", "RATE_SHEET", "MANIFEST", "WEIGHT_TICKET", "OTHER"] {
+        let body = format!("{doc_type} source document {}", Uuid::new_v4()).into_bytes();
+        let (st, _h, up) = app
+            .call_raw(
+                Method::POST,
+                &format!("/api/v1/documents?document_type={doc_type}&filename={}.txt", doc_type.to_lowercase()),
+                Some(&a.token),
+                Some("text/plain"),
+                body.clone(),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{doc_type}: {}", String::from_utf8_lossy(&up));
+        let id = serde_json::from_slice::<Value>(&up).unwrap()["id"].as_str().unwrap().to_string();
+        let path = format!("/api/v1/documents/{id}/download");
+
+        let (st, h, bytes) = app.call_raw(Method::GET, &path, Some(&a.token), None, Vec::new()).await;
+        assert_eq!(st, StatusCode::OK, "{doc_type}: owner can download");
+        assert_eq!(bytes, body, "{doc_type}: exact bytes");
+        let disp = h.get("content-disposition").unwrap().to_str().unwrap().to_string();
+        assert!(disp.starts_with("attachment;"), "{doc_type}: served as an attachment, got {disp}");
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+
+        let (st, _h, other) = app.call_raw(Method::GET, &path, Some(&b.token), None, Vec::new()).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{doc_type}: another organization must not download it");
+        assert!(!String::from_utf8_lossy(&other).contains(doc_type), "{doc_type}: no content leaks in the refusal");
+        let (st, _h, _b) = app.call_raw(Method::GET, &path, None, None, Vec::new()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{doc_type}: no token");
+        let (st, _h, _b) = app.call_raw(Method::GET, &path, Some("not-a-real-token"), None, Vec::new()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{doc_type}: bogus token");
+    }
+}
+
+/// GET returns the stored snapshot (same package, no new one created), never regenerates it, and is
+/// tenant-isolated and authenticated. A discrepancy with no package answers 404.
+#[tokio::test]
+async fn stored_evidence_is_retrievable_unchanged_and_tenant_isolated() {
+    let app = test_app().await;
+    let org = app.signup_org("ret-a").await;
+    let other = app.signup_org("ret-b").await;
+    let m = multi(&app, &org, "ret", &[], &[], false, &[("TRANSPORT", "600.00")]).await;
+    let r = run(&app, &org, &m.invoice_id).await;
+    let did = discrepancy_id(&r, "RULE_04_UNAUTHORIZED_FEE");
+    let path = format!("/api/v1/discrepancies/{did}/evidence");
+
+    let (st, _) = app.get(&path, &org.token).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "nothing is stored until a package is generated, and GET never creates one");
+
+    let generated = evidence(&app, &org, &did).await;
+    let (st, first) = app.get(&path, &org.token).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(first["id"], generated["id"], "GET returns the stored snapshot itself");
+    assert_eq!(first["content"], generated["content"], "the stored content is exactly what was generated");
+    assert!(first["created_at"].is_string(), "the snapshot carries its creation time");
+    let (_, second) = app.get(&path, &org.token).await;
+    assert_eq!(second["id"], first["id"], "repeated GETs never create or replace a snapshot");
+
+    let count = |tx_org: &TestOrg| {
+        let pool = app.pool.clone();
+        let org_id = tx_org.organization_id;
+        let did: Uuid = did.parse().unwrap();
+        async move {
+            let mut tx = xflow_backend::tenants::begin_scoped_tx(&pool, org_id).await.unwrap();
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence_packages WHERE discrepancy_id = $1").bind(did).fetch_one(&mut *tx).await.unwrap();
+            n
+        }
+    };
+    assert_eq!(count(&org).await, 1, "exactly one package exists after one POST and several GETs");
+
+    let (st, _body) = app.get(&path, &other.token).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "another organization cannot read the snapshot");
+    let (st, _h, _b) = app.call_raw(Method::GET, &path, None, None, Vec::new()).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

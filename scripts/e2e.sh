@@ -27,18 +27,29 @@ if port_busy "$API_PORT" || port_busy "$WEB_PORT"; then
   exit 1
 fi
 [ -x "$BACKEND_BIN" ] || { echo "BACKEND_BIN is not an executable file: $BACKEND_BIN (build it, or set BACKEND_BIN)" >&2; exit 1; }
-show_logs() { echo "--- API log (last 40 lines)"; tail -40 "$STORE/api.log" 2>/dev/null || true; echo "--- web log (last 40 lines)"; tail -40 "$STORE/web.log" 2>/dev/null || true; }
+show_logs() { echo "--- API log (last 40 lines)"; tail -n 40 "$STORE/api.log" 2>/dev/null || true; echo "--- web log (last 40 lines)"; tail -n 40 "$STORE/web.log" 2>/dev/null || true; }
 
 BIND_ADDR="127.0.0.1:$API_PORT" PADDLE_WEBHOOK_SECRET="$SECRET" BILLING_ENFORCEMENT=true WORKER_ENABLED=false STORAGE_DIR="$STORE" \
   "$BACKEND_BIN" >"$STORE/api.log" 2>&1 &
 PIDS="$PIDS $!"
-( cd "$ROOT/apps/web" && API_INTERNAL_URL="http://127.0.0.1:$API_PORT" INSECURE_COOKIES=1 PADDLE_CLIENT_TOKEN=test_e2e_token PADDLE_PRICE_ID=pri_e2e_monthly PADDLE_ENV=sandbox \
-  exec ./node_modules/.bin/next start -p "$WEB_PORT" >"$STORE/web.log" 2>&1 ) &
+# The web app is built with output: "standalone", so `next start` is the wrong launcher (it warns, and it is not
+# what production runs). Run the standalone server the way docker/Dockerfile.web does: the standalone tree plus
+# .next/static (and public/ if the app has one). They are copied into a temp dir so the build output is untouched.
+# HOSTNAME is deliberately NOT set: with HOSTNAME=127.0.0.1 the standalone server builds redirect URLs on
+# "localhost", which sends the browser to a different origin than the one it signed in on (cookies are per host).
+[ -f "$ROOT/apps/web/.next/standalone/server.js" ] || { echo "no standalone web build found: run 'npm run build' in apps/web first" >&2; exit 1; }
+WEB_DIR="$STORE/web"
+cp -R "$ROOT/apps/web/.next/standalone" "$WEB_DIR"
+mkdir -p "$WEB_DIR/.next"
+cp -R "$ROOT/apps/web/.next/static" "$WEB_DIR/.next/static"
+if [ -d "$ROOT/apps/web/public" ]; then cp -R "$ROOT/apps/web/public" "$WEB_DIR/public"; fi
+( cd "$WEB_DIR" && NODE_ENV=production PORT="$WEB_PORT" API_INTERNAL_URL="http://127.0.0.1:$API_PORT" INSECURE_COOKIES=1 PADDLE_CLIENT_TOKEN=test_e2e_token PADDLE_PRICE_ID=pri_e2e_monthly PADDLE_ENV=sandbox \
+  exec node server.js >"$STORE/web.log" 2>&1 ) &
 PIDS="$PIDS $!"
 
 i=0
 until curl -fs "http://127.0.0.1:$API_PORT/api/v1/health" >/dev/null && curl -fs "http://127.0.0.1:$WEB_PORT/login" >/dev/null; do
-  i=$((i+1)); [ "$i" -gt 60 ] && { echo "servers did not start"; tail -20 "$STORE/api.log" "$STORE/web.log"; exit 1; }
+  i=$((i+1)); [ "$i" -gt 60 ] && { echo "servers did not start"; echo "--- API log"; tail -n 20 "$STORE/api.log"; echo "--- web log"; tail -n 20 "$STORE/web.log"; exit 1; }
   sleep 1
 done
 
