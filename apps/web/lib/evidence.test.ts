@@ -93,7 +93,7 @@ test("a linked document the package does not describe gets no invented name or h
   const m = view(sampleContent()).documents.find((d) => d.role === "Manifest")!;
   assert.equal(m.state, "linked");
   assert.equal(m.doc!.filename, null); assert.equal(m.doc!.sha256, null);
-  assert.equal(m.doc!.href, "/api/proxy/documents/doc-manifest/download");
+  assert.equal(m.doc!.href, "/api/proxy/documents/5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a63/download");
 });
 
 test("manifest: absent key, recorded null and a present record are distinct", () => {

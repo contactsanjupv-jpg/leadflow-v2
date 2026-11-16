@@ -91,10 +91,10 @@ test("a single malformed entry reads in the singular", () => {
 
 test("source documents without a usable id cannot be shown, so they are flagged rather than skipped", () => {
   const sd = CASES[5];
-  const p = broken(sd, () => [{ original_filename: "no-id.pdf" }, { id: "", original_filename: "blank-id.pdf" }, { id: "doc-ok", original_filename: "ok.pdf", document_type: "OTHER", sha256: "c".repeat(64) }]);
+  const p = broken(sd, () => [{ original_filename: "no-id.pdf" }, { id: "", original_filename: "blank-id.pdf" }, { id: "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a66", original_filename: "ok.pdf", document_type: "OTHER", sha256: "c".repeat(64) }]);
   const v = view(p);
   assert.deepEqual(v.issues.sourceDocuments, { kind: "partial", skipped: 2, total: 3 });
-  assert.ok(v.documents.some((d) => d.doc?.id === "doc-ok"), "the usable document is still listed");
+  assert.ok(v.documents.some((d) => d.doc?.id === "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a66"), "the usable document is still listed");
   assert.ok(text(html(p)).includes("Incomplete: 2 of 3 source documents could not be read"));
 });
 
@@ -182,13 +182,13 @@ test("applicable rates where no entry is readable: same unconfirmed treatment", 
 
 test("the contract document is labelled as the parent's when it stands in for an unreadable list", () => {
   const p = withApplicable("oops");
-  p.content.contract_rate.contract_source_document_id = "doc-c";
-  p.content.source_documents = [{ id: "doc-c", document_type: "CONTRACT", original_filename: "contract.pdf", sha256: "d".repeat(64), created_at: "t" }];
-  const role = view(p).documents.find((d) => d.doc?.id === "doc-c")!.role;
+  p.content.contract_rate.contract_source_document_id = "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67";
+  p.content.source_documents = [{ id: "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67", document_type: "CONTRACT", original_filename: "contract.pdf", sha256: "d".repeat(64), created_at: "t" }];
+  const role = view(p).documents.find((d) => d.doc?.id === "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67")!.role;
   assert.ok(role.includes("parent rate, not confirmed as applicable"), role);
   // for a genuinely absent list the label stays plain
-  const q = withApplicable(undefined); q.content.contract_rate.contract_source_document_id = "doc-c"; q.content.source_documents = p.content.source_documents;
-  assert.ok(!view(q).documents.find((d) => d.doc?.id === "doc-c")!.role.includes("not confirmed"));
+  const q = withApplicable(undefined); q.content.contract_rate.contract_source_document_id = "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67"; q.content.source_documents = p.content.source_documents;
+  assert.ok(!view(q).documents.find((d) => d.doc?.id === "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67")!.role.includes("not confirmed"));
 });
 
 test("readable applicable rates beside malformed ones: the parent is NOT shown or marked, the readable rate is", () => {
@@ -224,11 +224,11 @@ test("unreadable applicable rates with no parent rate: only the alert, no rate b
 const STANDS_IN = "parent rate, not confirmed as applicable";
 function withContractDoc(applicable: unknown) {
   const p = withApplicable(applicable);
-  p.content.contract_rate.contract_source_document_id = "doc-c";
-  p.content.source_documents = [{ id: "doc-c", document_type: "CONTRACT", original_filename: "contract.pdf", sha256: "d".repeat(64), created_at: "t" }];
+  p.content.contract_rate.contract_source_document_id = "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67";
+  p.content.source_documents = [{ id: "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67", document_type: "CONTRACT", original_filename: "contract.pdf", sha256: "d".repeat(64), created_at: "t" }];
   return p;
 }
-const rolesFor = (p: unknown) => view(p).documents.filter((d) => d.doc?.id === "doc-c").map((d) => d.role);
+const rolesFor = (p: unknown) => view(p).documents.filter((d) => d.doc?.id === "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67").map((d) => d.role);
 
 test("applicable_rates with every entry malformed: the parent's contract document says it stands in, not 'Supporting document'", () => {
   const p = withContractDoc([null, "junk"]);
@@ -261,7 +261,7 @@ test("existing labels are unchanged for missing, null, empty and mixed applicabl
   assert.deepEqual(rolesFor(withContractDoc(null)), ["Contract — Example Disposal Agreement"]);
   assert.deepEqual(rolesFor(withContractDoc([])), ["Supporting document"], "an explicitly empty list keeps its existing behaviour");
   // mixed: the readable rate's own contract document is labelled plainly, with no stand-in wording
-  const mixed = withContractDoc([{ ...(clone(CT_2026_0915_GET) as any).content.applicable_rates[0], contract_source_document_id: "doc-c" }, null]);
+  const mixed = withContractDoc([{ ...(clone(CT_2026_0915_GET) as any).content.applicable_rates[0], contract_source_document_id: "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a67" }, null]);
   assert.deepEqual(rolesFor(mixed), ["Contract — Example Disposal Agreement"]);
 });
 

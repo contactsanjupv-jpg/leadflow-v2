@@ -13,6 +13,12 @@ import { formatMoney } from "./money";
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
+// Identifiers and hashes are validated, not just stringified. The backend download route takes a Uuid, and it
+// writes the document hash as 64 lowercase hex characters (documents.rs), so anything else is "unreadable".
+const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+const uuidText = (v: unknown): string | null => (typeof v === "string" && UUID.test(v) ? v : null);
+const sha256Text = (v: unknown): string | null => (typeof v === "string" && SHA256.test(v) ? v : null);
 const text = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v : typeof v === "number" ? String(v) : null);
 const has = (o: Obj | null, k: string): o is Obj => o !== null && Object.prototype.hasOwnProperty.call(o, k);
 
@@ -226,7 +232,10 @@ export function buildEvidenceView(raw: unknown): EvidenceResult {
   else {
     const m = content.manifest;
     const qty = cell(m, "quantity");
-    const unit = text(m.unit);
+    // The unit is a non-empty string. Missing: the quantity is shown without a unit. Present but not a usable string
+    // (number, object, array, boolean, blank, explicit null): the quantity is unreadable, never shown half-formed.
+    const unit = cell(m, "unit");
+    const unitBad = unit.state === "unreadable" || unit.state === "null";
     const tickets = ticketList.rows;
     manifest = {
       state: "present",
@@ -234,7 +243,7 @@ export function buildEvidenceView(raw: unknown): EvidenceResult {
         field("Manifest number", m, "manifest_number"),
         field("Waste stream", m, "waste_stream"),
         field("Shipment date", m, "shipment_date"),
-        { label: "Quantity", ...(qty.state === "value" && unit ? { ...qty, value: `${qty.value} ${unit}` } : qty) },
+        { label: "Quantity", ...(unitBad ? { ...qty, state: "unreadable" as const, value: null } : qty.state === "value" && unit.state === "value" ? { ...qty, value: `${qty.value} ${unit.value}` } : qty) },
         field("Containers", m, "container_count", { allowNumber: true }),
       ],
       tickets: tickets && tickets.map((t) => ({ number: cell(t, "ticket_number"), netWeight: cell(t, "net_weight"), unit: cell(t, "unit"), date: cell(t, "ticket_date") })),
@@ -242,20 +251,21 @@ export function buildEvidenceView(raw: unknown): EvidenceResult {
   }
 
   // ---- source documents: which record points at which document, and whether it points at one at all
-  const docList = listOf(content, "source_documents", (r) => text(r.id) !== null);
+  const docList = listOf(content, "source_documents", (r) => uuidText(r.id) !== null);
   const listed = docList.rows ?? [];
-  const byId = new Map(listed.map((x) => [text(x.id) ?? "", x]));
+  const byId = new Map(listed.map((x) => [(uuidText(x.id) as string).toLowerCase(), x]));
   const docRef = (id: string): DocRef => {
-    const k = byId.get(id);
+    const k = byId.get(id.toLowerCase());
     // Document metadata is text: only a non-empty STRING is readable (unlike text(), a number is not converted).
     // Missing and explicit null stay as they were (no value, not flagged); anything else present is unreadable.
     const metaText = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v : null);
-    const detailsUnreadable = !!k && ["original_filename", "document_type", "sha256"].some((key) => has(k, key) && k[key] !== null && metaText(k[key]) === null);
-    return { id, filename: k ? metaText(k.original_filename) : null, documentType: k ? metaText(k.document_type) : null, sha256: k ? metaText(k.sha256) : null, href: `/api/proxy/documents/${encodeURIComponent(id)}/download`, detailsUnreadable };
+    const readers: Record<string, (v: unknown) => string | null> = { original_filename: metaText, document_type: metaText, sha256: sha256Text };
+    const detailsUnreadable = !!k && Object.entries(readers).some(([key, read]) => has(k, key) && k[key] !== null && read(k[key]) === null);
+    return { id, filename: k ? metaText(k.original_filename) : null, documentType: k ? metaText(k.document_type) : null, sha256: k ? sha256Text(k.sha256) : null, href: `/api/proxy/documents/${encodeURIComponent(id)}/download`, detailsUnreadable };
   };
   const links: DocLink[] = [];
   const link = (role: string, o: Src, key: string) => {
-    const c = cell(o, key);
+    const c = cell(o, key, { format: uuidText }); // a reference that is not a UUID can never be a download link
     const l: DocLink = { role, state: c.state === "value" ? "linked" : c.state === "null" ? "none" : c.state === "unreadable" ? "unreadable" : "absent", doc: c.state === "value" ? docRef(c.value as string) : null };
     if (!links.some((x) => x.role === l.role && x.state === l.state && x.doc?.id === l.doc?.id)) links.push(l);
   };
@@ -269,7 +279,7 @@ export function buildEvidenceView(raw: unknown): EvidenceResult {
   if (manifest.state === "present") link("Manifest", content.manifest as Obj, "source_document_id");
   for (const t of ticketList.rows ?? []) link(`Weight ticket${text(t.ticket_number) ? " " + text(t.ticket_number) : ""}`, t, "source_document_id");
   // A package can list documents that no record points at; keep them visible.
-  for (const x of listed) { const id = text(x.id); if (id && !links.some((l) => l.doc?.id === id)) links.push({ role: "Supporting document", state: "linked", doc: docRef(id) }); }
+  for (const x of listed) { const id = uuidText(x.id); if (id && !links.some((l) => l.doc?.id.toLowerCase() === id.toLowerCase())) links.push({ role: "Supporting document", state: "linked", doc: docRef(id) }); }
 
   const basisRaw = has(content, "applicable_rates_basis") ? content.applicable_rates_basis : null;
   const basis = typeof basisRaw === "string" && basisRaw.trim() !== "" ? basisRaw : null;

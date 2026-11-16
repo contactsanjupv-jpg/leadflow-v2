@@ -84,14 +84,14 @@ test("priced-line ids, fee code, basis and source-document references are checke
   p.content.applicable_rates[0].authorized_fees = [{ fee_code: { x: 1 }, description: null, amount: "1.0000", charge_type: "CAP" }];
   p.content.applicable_rates_basis = { x: 1 };
   p.content.invoice.source_document_id = { x: 1 };
-  p.content.source_documents = [{ id: "doc-1", document_type: "INVOICE", original_filename: { x: 1 }, sha256: "a".repeat(64), created_at: "t" }];
-  p.content.manifest.source_document_id = "doc-1";
+  p.content.source_documents = [{ id: "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a68", document_type: "INVOICE", original_filename: { x: 1 }, sha256: "a".repeat(64), created_at: "t" }];
+  p.content.manifest.source_document_id = "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a68";
   const v = view(p);
   assert.equal(v.rates.applicable![0].pricedLines.state, "unreadable");
   assert.equal(v.rates.applicable![0].fees![0].code.state, "unreadable");
   assert.equal(v.rates.basisUnreadable, true);
   assert.equal(v.documents.find((d) => d.role === "Invoice")!.state, "unreadable");
-  assert.equal(v.documents.find((d) => d.doc?.id === "doc-1")!.doc!.detailsUnreadable, true);
+  assert.equal(v.documents.find((d) => d.doc?.id === "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a68")!.doc!.detailsUnreadable, true);
   const h = html(p);
   assert.ok(h.includes('data-testid="evidence-basis-unreadable"') && text(h).includes("Unreadable source-document reference") && text(h).includes("Some document details could not be read"));
 });
@@ -167,12 +167,12 @@ test("valid packages: no unreadable marker, no object alert, no banner (backend-
 const META_KEYS = ["original_filename", "document_type", "sha256"] as const;
 function withDoc(meta: Record<string, unknown>, how: "linked" | "listed" = "linked") {
   const p = ct();
-  if (how === "linked") p.content.invoice.source_document_id = "doc-1";
+  if (how === "linked") p.content.invoice.source_document_id = "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a68";
   else p.content.invoice.source_document_id = null;
-  p.content.source_documents = [{ id: "doc-1", document_type: "INVOICE", original_filename: "invoice.pdf", sha256: "a".repeat(64), created_at: "t", ...meta }];
+  p.content.source_documents = [{ id: "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a68", document_type: "INVOICE", original_filename: "invoice.pdf", sha256: "a".repeat(64), created_at: "t", ...meta }];
   return p;
 }
-const docOf = (p: unknown) => view(p).documents.find((d) => d.doc?.id === "doc-1")!.doc!;
+const docOf = (p: unknown) => view(p).documents.find((d) => d.doc?.id === "5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a68")!.doc!;
 
 test("document metadata: numeric, boolean, object, array and blank values are unreadable and never displayed as text", () => {
   for (const key of META_KEYS) {
@@ -197,7 +197,7 @@ test("document metadata: a numeric value is not rendered as if it were a filenam
   const h = text(html(p));
   for (const n of ["987654", "555111", "424242"]) assert.ok(!h.includes(n), n);
   assert.ok(h.includes("name not included in this package"), "no filename is shown, and the document is still downloadable");
-  assert.ok(html(p).includes('href="/api/proxy/documents/doc-1/download"'));
+  assert.ok(html(p).includes('href="/api/proxy/documents/5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a68/download"'));
 });
 
 test("document metadata: missing keys and explicit null are unchanged (no value, not flagged)", () => {

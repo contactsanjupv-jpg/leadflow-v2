@@ -62,7 +62,7 @@ test("missing versus empty: manifest, weight tickets, lists and source documents
 
 test("linked source documents show their name and a download link", () => {
   const html = render(synthetic());
-  assert.ok(html.includes('href="/api/proxy/documents/doc-invoice/download"') && html.includes("CT-2026-0915.pdf") && html.includes("clean-harbors-contract.pdf"));
+  assert.ok(html.includes('href="/api/proxy/documents/5b1f6c2e-8a3d-4f60-9b7a-1c2d3e4f5a61/download"') && html.includes("CT-2026-0915.pdf") && html.includes("clean-harbors-contract.pdf"));
   assert.ok(html.includes("name not included in this package"));
   assert.ok(html.includes("cap: maximum allowed") && html.includes("unclassified: type not set"));
 });
