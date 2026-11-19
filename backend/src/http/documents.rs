@@ -181,6 +181,85 @@ pub async fn get_document(
     Ok(Json(doc))
 }
 
+/// Candidate invoice fields read from the document's extracted text (Step 15a).
+///
+/// READ-ONLY by construction: it inserts nothing, changes no document status, creates no invoice and
+/// feeds nothing to reconciliation. The candidates are computed on demand by a pure, versioned function of
+/// the stored extraction text (`extraction::invoice_parser`), so reading them twice gives identical output.
+/// A person must review and confirm them through a later, separate step before any invoice exists.
+pub async fn invoice_candidates(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    user.require(Permission::ViewData)?;
+    let mut tx = scoped_tx(&state, &user).await?;
+    let doc: Option<(String, String)> =
+        sqlx::query_as("SELECT document_type::text, status::text FROM documents WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (doc_type, status) = doc.ok_or(AppError::NotFound)?;
+    if doc_type != "INVOICE" {
+        return Err(AppError::Conflict(format!(
+            "invoice candidates are only available for documents of type INVOICE (this one is {doc_type})"
+        )));
+    }
+    let extraction: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(e) FROM (SELECT id, extractor_provider, raw_extraction, created_at FROM document_extractions WHERE document_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1) e")
+        .bind(id).fetch_optional(&mut *tx).await?;
+    let extraction = extraction.ok_or_else(|| {
+        AppError::Conflict(
+            "this document has no extracted text (for example a scanned PDF or an image), so there are no candidates; enter the invoice manually and link this document as its source".to_string(),
+        )
+    })?;
+    let text = extraction["raw_extraction"]["text"].as_str().ok_or_else(|| {
+        AppError::Conflict("the stored extraction has no text, so there are no candidates".to_string())
+    })?;
+    let truncated = extraction["raw_extraction"]["truncated"].as_bool().unwrap_or(false);
+
+    let mut candidates = crate::extraction::invoice_parser::parse_invoice_text(text);
+    if truncated {
+        crate::extraction::invoice_parser::mark_text_truncated(&mut candidates);
+    }
+
+    let linked: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM invoices WHERE source_document_id = $1 ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // Suggest an existing vendor ONLY on an exact (case-insensitive, trimmed) name match with exactly one
+    // vendor. It is a suggestion for the person to confirm; a vendor is never created or chosen here.
+    let mut vendor_suggestion = Value::Null;
+    if let Some(name) = candidates.vendor_name.value.as_deref() {
+        let matches: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, name FROM vendors WHERE lower(btrim(name)) = lower(btrim($1)) ORDER BY id LIMIT 2",
+        )
+        .bind(name)
+        .fetch_all(&mut *tx)
+        .await?;
+        if matches.len() == 1 {
+            vendor_suggestion = json!({ "vendor_id": matches[0].0, "name": matches[0].1, "match": "exact_name" });
+        }
+    }
+
+    let provider = extraction["extractor_provider"].clone();
+    let extraction_id = extraction["id"].clone();
+    let extracted_at = extraction["created_at"].clone();
+    Ok(Json(json!({
+        "document_id": id,
+        "document_status": status,
+        "reviewable": status == "REVIEW_REQUIRED" && linked.is_none(),
+        "linked_invoice_id": linked,
+        "extraction": { "id": extraction_id, "provider": provider, "created_at": extracted_at, "text_truncated": truncated },
+        "parser_version": crate::extraction::invoice_parser::PARSER_VERSION,
+        "candidates": candidates,
+        "vendor_suggestion": vendor_suggestion,
+        "notice": "These are candidates, not records. Nothing has been created; every value must be reviewed and confirmed by a person. An extracted value is not proof that it is correct.",
+    })))
+}
+
 pub async fn download_document(
     user: AuthedUser,
     State(state): State<AppState>,

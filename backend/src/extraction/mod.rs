@@ -8,6 +8,8 @@
 //! Extraction output is stored for review and is NEVER turned into invoices/manifests/rates
 //! automatically, and never feeds the financial engine. `ChainExtractor` tries providers in order.
 
+pub mod invoice_parser;
+
 use serde_json::{json, Value};
 
 #[derive(Debug)]

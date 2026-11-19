@@ -81,6 +81,10 @@ pub fn build_router_with_cors(state: AppState, cors_origins: &[String]) -> Route
         .route("/api/v1/documents", get(documents::list_documents))
         .route("/api/v1/documents/:id", get(documents::get_document))
         .route(
+            "/api/v1/documents/:id/invoice-candidates",
+            get(documents::invoice_candidates),
+        )
+        .route(
             "/api/v1/documents/:id/resolve",
             post(documents::resolve_document),
         )
