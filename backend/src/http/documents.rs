@@ -181,23 +181,26 @@ pub async fn get_document(
     Ok(Json(doc))
 }
 
-/// Candidate invoice fields read from the document's extracted text (Step 15a).
-///
-/// READ-ONLY by construction: it inserts nothing, changes no document status, creates no invoice and
-/// feeds nothing to reconciliation. The candidates are computed on demand by a pure, versioned function of
-/// the stored extraction text (`extraction::invoice_parser`), so reading them twice gives identical output.
-/// A person must review and confirm them through a later, separate step before any invoice exists.
-pub async fn invoice_candidates(
-    user: AuthedUser,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Value>, AppError> {
-    user.require(Permission::ViewData)?;
-    let mut tx = scoped_tx(&state, &user).await?;
+/// What the invoice-candidates view and the confirmation endpoint both start from: the document's status, its
+/// latest stored extraction, and the candidates the CURRENT parser derives from that text (with truncation
+/// applied). Read-only; callers own the transaction (the confirmation endpoint locks the document row first).
+pub struct LoadedInvoiceCandidates {
+    pub document_status: String,
+    pub extraction_id: Uuid,
+    pub extraction_provider: Value,
+    pub extraction_created_at: Value,
+    pub text_truncated: bool,
+    pub candidates: crate::extraction::invoice_parser::InvoiceCandidates,
+}
+
+pub async fn load_invoice_candidates(
+    tx: &mut crate::http::util::Tx,
+    id: Uuid,
+) -> Result<LoadedInvoiceCandidates, AppError> {
     let doc: Option<(String, String)> =
         sqlx::query_as("SELECT document_type::text, status::text FROM documents WHERE id = $1")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
     let (doc_type, status) = doc.ok_or(AppError::NotFound)?;
     if doc_type != "INVOICE" {
@@ -206,7 +209,7 @@ pub async fn invoice_candidates(
         )));
     }
     let extraction: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(e) FROM (SELECT id, extractor_provider, raw_extraction, created_at FROM document_extractions WHERE document_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1) e")
-        .bind(id).fetch_optional(&mut *tx).await?;
+        .bind(id).fetch_optional(&mut **tx).await?;
     let extraction = extraction.ok_or_else(|| {
         AppError::Conflict(
             "this document has no extracted text (for example a scanned PDF or an image), so there are no candidates; enter the invoice manually and link this document as its source".to_string(),
@@ -215,12 +218,42 @@ pub async fn invoice_candidates(
     let text = extraction["raw_extraction"]["text"].as_str().ok_or_else(|| {
         AppError::Conflict("the stored extraction has no text, so there are no candidates".to_string())
     })?;
-    let truncated = extraction["raw_extraction"]["truncated"].as_bool().unwrap_or(false);
+    let text_truncated = extraction["raw_extraction"]["truncated"].as_bool().unwrap_or(false);
+    let extraction_id = extraction["id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("stored extraction has no valid id")))?;
 
     let mut candidates = crate::extraction::invoice_parser::parse_invoice_text(text);
-    if truncated {
+    if text_truncated {
         crate::extraction::invoice_parser::mark_text_truncated(&mut candidates);
     }
+    Ok(LoadedInvoiceCandidates {
+        document_status: status,
+        extraction_id,
+        extraction_provider: extraction["extractor_provider"].clone(),
+        extraction_created_at: extraction["created_at"].clone(),
+        text_truncated,
+        candidates,
+    })
+}
+
+/// Candidate invoice fields read from the document's extracted text (Step 15a).
+///
+/// READ-ONLY by construction: it inserts nothing, changes no document status, creates no invoice and
+/// feeds nothing to reconciliation. The candidates are computed on demand by a pure, versioned function of
+/// the stored extraction text (`extraction::invoice_parser`), so reading them twice gives identical output.
+/// A person must review and confirm them through a later, separate step before any invoice exists.
+/// `confirmation_requirements` (Step 15b-3) is additive: the server-derived acknowledgments a confirmation
+/// will have to carry; the client never decides them.
+pub async fn invoice_candidates(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    user.require(Permission::ViewData)?;
+    let mut tx = scoped_tx(&state, &user).await?;
+    let loaded = load_invoice_candidates(&mut tx, id).await?;
 
     let linked: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM invoices WHERE source_document_id = $1 ORDER BY created_at, id LIMIT 1",
@@ -232,7 +265,7 @@ pub async fn invoice_candidates(
     // Suggest an existing vendor ONLY on an exact (case-insensitive, trimmed) name match with exactly one
     // vendor. It is a suggestion for the person to confirm; a vendor is never created or chosen here.
     let mut vendor_suggestion = Value::Null;
-    if let Some(name) = candidates.vendor_name.value.as_deref() {
+    if let Some(name) = loaded.candidates.vendor_name.value.as_deref() {
         let matches: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT id, name FROM vendors WHERE lower(btrim(name)) = lower(btrim($1)) ORDER BY id LIMIT 2",
         )
@@ -244,17 +277,19 @@ pub async fn invoice_candidates(
         }
     }
 
-    let provider = extraction["extractor_provider"].clone();
-    let extraction_id = extraction["id"].clone();
-    let extracted_at = extraction["created_at"].clone();
+    let requirements = crate::extraction::invoice_confirmation::confirmation_requirements(
+        &loaded.candidates,
+        loaded.text_truncated,
+    );
     Ok(Json(json!({
         "document_id": id,
-        "document_status": status,
-        "reviewable": status == "REVIEW_REQUIRED" && linked.is_none(),
+        "document_status": loaded.document_status,
+        "reviewable": loaded.document_status == "REVIEW_REQUIRED" && linked.is_none(),
         "linked_invoice_id": linked,
-        "extraction": { "id": extraction_id, "provider": provider, "created_at": extracted_at, "text_truncated": truncated },
+        "extraction": { "id": loaded.extraction_id, "provider": loaded.extraction_provider, "created_at": loaded.extraction_created_at, "text_truncated": loaded.text_truncated },
         "parser_version": crate::extraction::invoice_parser::PARSER_VERSION,
-        "candidates": candidates,
+        "candidates": loaded.candidates,
+        "confirmation_requirements": requirements,
         "vendor_suggestion": vendor_suggestion,
         "notice": "These are candidates, not records. Nothing has been created; every value must be reviewed and confirmed by a person. An extracted value is not proof that it is correct.",
     })))

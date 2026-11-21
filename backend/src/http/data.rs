@@ -479,12 +479,26 @@ SELECT to_jsonb(i) || jsonb_build_object(
 FROM (SELECT id, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total::text AS total,
              source_document_id, manifest_id, created_at, updated_at FROM invoices WHERE id = $1) i"#;
 
-pub async fn create_invoice(
-    user: AuthedUser,
-    State(state): State<AppState>,
-    Json(req): Json<NewInvoice>,
-) -> Created {
-    user.require(Permission::ManageData)?;
+/// One validated invoice line, exactly as it will be inserted.
+pub struct ValidatedLine {
+    pub description: String,
+    pub fee_code: Option<String>,
+    pub quantity: Decimal,
+    pub unit: String,
+    pub unit_price: Decimal,
+    pub line_total: Decimal,
+}
+
+/// The result of `validate_new_invoice`: trimmed text and exact decimals, ready to insert.
+pub struct ValidatedInvoice {
+    pub invoice_number: String,
+    pub waste_stream: String,
+    pub lines: Vec<ValidatedLine>,
+}
+
+/// Pure (no database) validation shared by every path that creates an invoice. Moved unchanged from
+/// `create_invoice`: same checks, same order, same messages.
+pub fn validate_new_invoice(req: &NewInvoice) -> Result<ValidatedInvoice, AppError> {
     let invoice_number = clean_text("invoice_number", &req.invoice_number, 100)?;
     let waste_stream = clean_text("waste_stream", &req.waste_stream, 100)?;
     check_date("invoice_date", req.invoice_date)?;
@@ -528,14 +542,14 @@ pub async fn create_invoice(
 
         sum_line_totals += line_total;
 
-        lines.push((
+        lines.push(ValidatedLine {
             description,
             fee_code,
             quantity,
             unit,
             unit_price,
             line_total,
-        ));
+        });
     }
 
     if (req.total.get() - sum_line_totals).abs() > rounding_tolerance {
@@ -546,33 +560,90 @@ pub async fn create_invoice(
         )));
     }
 
-    let mut tx = scoped_tx(&state, &user).await?;
-    ensure_owned(&mut tx, "vendors", req.vendor_id).await?;
+    Ok(ValidatedInvoice {
+        invoice_number,
+        waste_stream,
+        lines,
+    })
+}
+
+/// Name of the partial unique index from migration 0015 (one source document backs at most one invoice).
+const INVOICE_SOURCE_DOCUMENT_UNIQUE: &str = "invoices_source_document_uniq";
+
+/// Constraint-aware mapping for the invoice INSERT. The new source-document index gets its own 409 message;
+/// every other unique/exclusion violation keeps the existing vendor + invoice-number message, so existing
+/// duplicate-invoice behaviour is unchanged.
+fn invoice_insert_conflict(e: sqlx::Error) -> AppError {
+    if let Some(db) = e.as_database_error() {
+        if db.code().as_deref() == Some("23505")
+            && db.constraint() == Some(INVOICE_SOURCE_DOCUMENT_UNIQUE)
+        {
+            return AppError::Conflict(
+                "this source document already backs another invoice; one document can back only one invoice"
+                    .to_string(),
+            );
+        }
+    }
+    conflict_on_constraint(e, "this vendor already has an invoice with that number")
+}
+
+/// Shared insertion for every path that creates an invoice (manual `POST /invoices` today; document
+/// confirmation next). Runs inside the caller's tenant-scoped transaction and does NOT commit.
+///
+/// Order is part of the contract:
+///   1. ownership checks (unknown or foreign ids are 404; FK checks bypass RLS),
+///   2. when a source document is linked, lock its row `FOR UPDATE` BEFORE inserting the invoice,
+///   3. insert the invoice and its lines, `mark_used`, write the `invoice.create` audit row.
+/// Every creator therefore takes the locks in the same order (document row, then the invoice's unique-index
+/// entries), so a manual create racing a confirmation of the same document waits instead of deadlocking.
+pub async fn insert_validated_invoice(
+    tx: &mut Tx,
+    user: &AuthedUser,
+    req: &NewInvoice,
+    v: &ValidatedInvoice,
+) -> Result<Uuid, AppError> {
+    ensure_owned(tx, "vendors", req.vendor_id).await?;
     if let Some(m) = req.manifest_id {
-        ensure_owned(&mut tx, "manifests", m).await?;
+        ensure_owned(tx, "manifests", m).await?;
     }
     if let Some(d) = req.source_document_id {
-        ensure_owned(&mut tx, "documents", d).await?;
+        ensure_owned(tx, "documents", d).await?;
+        sqlx::query("SELECT id FROM documents WHERE id = $1 FOR UPDATE")
+            .bind(d)
+            .fetch_one(&mut **tx)
+            .await?;
     }
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO invoices (organization_id, vendor_id, invoice_number, invoice_date, service_date, facility_id, waste_stream, total, source_document_id, manifest_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
     )
-    .bind(user.organization_id).bind(req.vendor_id).bind(&invoice_number).bind(req.invoice_date).bind(req.service_date)
-    .bind(req.facility_id).bind(&waste_stream).bind(req.total.get()).bind(req.source_document_id).bind(req.manifest_id)
-    .fetch_one(&mut *tx)
+    .bind(user.organization_id).bind(req.vendor_id).bind(&v.invoice_number).bind(req.invoice_date).bind(req.service_date)
+    .bind(req.facility_id).bind(&v.waste_stream).bind(req.total.get()).bind(req.source_document_id).bind(req.manifest_id)
+    .fetch_one(&mut **tx)
     .await
-    .map_err(|e| conflict_on_constraint(e, "this vendor already has an invoice with that number"))?;
-    for (description, fee_code, quantity, unit, unit_price, line_total) in &lines {
+    .map_err(invoice_insert_conflict)?;
+    for l in &v.lines {
         sqlx::query("INSERT INTO invoice_line_items (invoice_id, organization_id, description, fee_code, quantity, unit, unit_price, line_total) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
-            .bind(id).bind(user.organization_id).bind(description).bind(fee_code).bind(quantity).bind(unit).bind(unit_price).bind(line_total)
-            .execute(&mut *tx).await?;
+            .bind(id).bind(user.organization_id).bind(&l.description).bind(&l.fee_code).bind(l.quantity).bind(&l.unit).bind(l.unit_price).bind(l.line_total)
+            .execute(&mut **tx).await?;
     }
     if let Some(d) = req.source_document_id {
-        crate::http::documents::mark_used(&mut tx, d, "an invoice").await?;
+        crate::http::documents::mark_used(tx, d, "an invoice").await?;
     }
-    audit::record(&mut tx, user.organization_id, Some(user.user_id), "invoice.create", "invoice", Some(id), None,
-        Some(json!({ "vendor_id": req.vendor_id, "invoice_number": invoice_number, "total": req.total.get().to_string(), "line_count": lines.len(), "manifest_id": req.manifest_id }))).await?;
+    audit::record(tx, user.organization_id, Some(user.user_id), "invoice.create", "invoice", Some(id), None,
+        Some(json!({ "vendor_id": req.vendor_id, "invoice_number": v.invoice_number, "total": req.total.get().to_string(), "line_count": v.lines.len(), "manifest_id": req.manifest_id }))).await?;
+    Ok(id)
+}
+
+pub async fn create_invoice(
+    user: AuthedUser,
+    State(state): State<AppState>,
+    Json(req): Json<NewInvoice>,
+) -> Created {
+    user.require(Permission::ManageData)?;
+    let validated = validate_new_invoice(&req)?;
+    let mut tx = scoped_tx(&state, &user).await?;
+    let id = insert_validated_invoice(&mut tx, &user, &req, &validated).await?;
     let body = json_one(&mut tx, INVOICE_DETAIL_SQL, id).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(body)))
@@ -925,5 +996,64 @@ mod tests {
             "fee_code": "TRANSPORT", "amount": "500.00", "charge_type": "EXACT", "charge_type_set_by": "x"
         }));
         assert!(r.is_err());
+    }
+}
+
+#[cfg(test)]
+mod invoice_validation_tests {
+    //! Regression locks for the logic moved out of `create_invoice` (pure; no database).
+    use super::*;
+
+    fn invoice(extra: Value) -> NewInvoice {
+        let mut v = json!({
+            "vendor_id": Uuid::nil(), "invoice_number": "  INV-1  ", "invoice_date": "2026-03-15", "service_date": "2026-03-20",
+            "waste_stream": " F003 ", "total": "4500.00",
+            "line_items": [
+                { "description": "Drum disposal", "fee_code": " DISP ", "quantity": "10", "unit": "drum", "unit_price": "400.00", "line_total": "4000.00" },
+                { "description": "Transportation", "quantity": "1", "unit": "flat", "unit_price": "500.00", "line_total": "500.00" }
+            ]
+        });
+        if let (Some(base), Some(over)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in over {
+                base.insert(k.clone(), val.clone());
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn rejected(req: NewInvoice) -> String {
+        match validate_new_invoice(&req) {
+            Err(AppError::Validation(m)) => m,
+            Err(other) => panic!("expected Validation, got {other:?}"),
+            Ok(_) => panic!("expected a rejection"),
+        }
+    }
+
+    #[test]
+    fn a_valid_invoice_is_trimmed_and_keeps_exact_decimals() {
+        let v = validate_new_invoice(&invoice(json!({}))).unwrap();
+        assert_eq!((v.invoice_number.as_str(), v.waste_stream.as_str()), ("INV-1", "F003"));
+        assert_eq!(v.lines.len(), 2);
+        assert_eq!(v.lines[0].fee_code.as_deref(), Some("DISP"));
+        assert_eq!(v.lines[1].fee_code, None);
+        assert_eq!(v.lines[0].line_total.to_string(), "4000.00");
+    }
+
+    #[test]
+    fn line_arithmetic_and_invoice_total_use_the_one_cent_tolerance() {
+        let off = invoice(json!({ "line_items": [{ "description": "A", "quantity": "3", "unit": "ea", "unit_price": "0.333", "line_total": "1.00" }], "total": "1.00" }));
+        assert!(validate_new_invoice(&off).is_ok(), "0.001 off is within tolerance");
+        let bad_line = invoice(json!({ "line_items": [{ "description": "A", "quantity": "3", "unit": "ea", "unit_price": "0.333", "line_total": "1.02" }], "total": "1.02" }));
+        assert!(rejected(bad_line).contains("difference exceeds the $0.01 rounding tolerance"));
+        assert!(rejected(invoice(json!({ "total": "4600.00" }))).contains("does not match the sum of line totals"));
+    }
+
+    #[test]
+    fn structural_limits_and_dates_are_still_enforced() {
+        assert!(rejected(invoice(json!({ "line_items": [] }))).contains("at least one line item"));
+        let many: Vec<Value> = (0..501).map(|_| json!({ "description": "A", "quantity": "1", "unit": "ea", "unit_price": "0.00", "line_total": "0.00" })).collect();
+        assert!(rejected(invoice(json!({ "line_items": many, "total": "0.00" }))).contains("too many line items"));
+        assert!(rejected(invoice(json!({ "invoice_date": "1850-01-01" }))).contains("invoice_date"));
+        assert!(rejected(invoice(json!({ "invoice_number": "   " }))).contains("invoice_number must not be empty"));
     }
 }
