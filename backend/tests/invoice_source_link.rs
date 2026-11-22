@@ -184,3 +184,30 @@ async fn a_manual_create_racing_a_document_first_transaction_waits_instead_of_de
     assert_eq!(invoice_count(&app, &org.token).await, 1);
     assert_eq!(doc_status(&app, &org.token, &doc).await, "PROCESSED");
 }
+
+/// Step 15b hardening: the wording recorded on the source document by a MANUAL invoice create is unchanged
+/// (a confirmed-extraction path records its own wording; see `documents::CONFIRMED_EXTRACTION_DETAIL`).
+#[tokio::test]
+async fn manual_creation_still_records_the_manual_status_detail_on_the_source_document() {
+    let app = test_app().await;
+    let org = app.signup_org("sl-detail").await;
+    let v = vendor(&app, &org.token).await;
+    let doc = upload_doc(&app, &org.token).await;
+    let (s, inv) = app
+        .post(
+            "/api/v1/invoices",
+            &org.token,
+            body(&v, "SL-DETAIL-1", Some(&doc)),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{inv}");
+    let d = app
+        .get(&format!("/api/v1/documents/{doc}"), &org.token)
+        .await
+        .1;
+    assert_eq!(d["status"], "PROCESSED");
+    assert_eq!(
+        d["status_detail"],
+        "data entered manually and linked to an invoice"
+    );
+}

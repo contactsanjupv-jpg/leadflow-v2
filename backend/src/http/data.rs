@@ -587,6 +587,16 @@ fn invoice_insert_conflict(e: sqlx::Error) -> AppError {
     conflict_on_constraint(e, "this vendor already has an invoice with that number")
 }
 
+/// Who created the invoice. Decides only the `status_detail` written on the linked source document; the
+/// insert, its order, the lock and the `invoice.create` audit row are identical for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceOrigin {
+    /// A person typed the invoice in (`POST /invoices`).
+    Manual,
+    /// Created from extracted text that a person reviewed and confirmed (Step 15b).
+    ConfirmedExtraction,
+}
+
 /// Shared insertion for every path that creates an invoice (manual `POST /invoices` today; document
 /// confirmation next). Runs inside the caller's tenant-scoped transaction and does NOT commit.
 ///
@@ -601,6 +611,7 @@ pub async fn insert_validated_invoice(
     user: &AuthedUser,
     req: &NewInvoice,
     v: &ValidatedInvoice,
+    origin: InvoiceOrigin,
 ) -> Result<Uuid, AppError> {
     ensure_owned(tx, "vendors", req.vendor_id).await?;
     if let Some(m) = req.manifest_id {
@@ -628,7 +639,17 @@ pub async fn insert_validated_invoice(
             .execute(&mut **tx).await?;
     }
     if let Some(d) = req.source_document_id {
-        crate::http::documents::mark_used(tx, d, "an invoice").await?;
+        match origin {
+            InvoiceOrigin::Manual => crate::http::documents::mark_used(tx, d, "an invoice").await?,
+            InvoiceOrigin::ConfirmedExtraction => {
+                crate::http::documents::mark_used_with_detail(
+                    tx,
+                    d,
+                    crate::http::documents::CONFIRMED_EXTRACTION_DETAIL,
+                )
+                .await?
+            }
+        }
     }
     audit::record(tx, user.organization_id, Some(user.user_id), "invoice.create", "invoice", Some(id), None,
         Some(json!({ "vendor_id": req.vendor_id, "invoice_number": v.invoice_number, "total": req.total.get().to_string(), "line_count": v.lines.len(), "manifest_id": req.manifest_id }))).await?;
@@ -643,7 +664,8 @@ pub async fn create_invoice(
     user.require(Permission::ManageData)?;
     let validated = validate_new_invoice(&req)?;
     let mut tx = scoped_tx(&state, &user).await?;
-    let id = insert_validated_invoice(&mut tx, &user, &req, &validated).await?;
+    let id =
+        insert_validated_invoice(&mut tx, &user, &req, &validated, InvoiceOrigin::Manual).await?;
     let body = json_one(&mut tx, INVOICE_DETAIL_SQL, id).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(body)))

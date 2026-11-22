@@ -379,13 +379,64 @@ pub async fn resolve_document(
     Ok(Json(out))
 }
 
+/// `status_detail` recorded when a person typed the record in by hand and linked this document to it.
+/// Exact wording is relied on by existing behaviour; do not change it.
+pub fn manual_link_detail(label: &str) -> String {
+    format!("data entered manually and linked to {label}")
+}
+
+/// `status_detail` recorded when an invoice was created from extracted text that a person reviewed and
+/// confirmed (Step 15b). It must never say the data was entered manually.
+pub const CONFIRMED_EXTRACTION_DETAIL: &str =
+    "invoice created from extracted text and confirmed by a person";
+
 /// Called by record-creating endpoints when a `source_document_id` is linked: a document awaiting manual
 /// entry is now accounted for. Does not touch documents in any other state.
 pub async fn mark_used(tx: &mut Tx, document_id: Uuid, label: &str) -> Result<(), sqlx::Error> {
+    mark_used_with_detail(tx, document_id, &manual_link_detail(label)).await
+}
+
+/// Same transition as `mark_used` (REVIEW_REQUIRED -> PROCESSED, nothing else is touched) with an explicit
+/// `status_detail`.
+pub async fn mark_used_with_detail(
+    tx: &mut Tx,
+    document_id: Uuid,
+    detail: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE documents SET status = 'PROCESSED', status_detail = $2, updated_at = now() WHERE id = $1 AND status = 'REVIEW_REQUIRED'")
         .bind(document_id)
-        .bind(format!("data entered manually and linked to {label}"))
+        .bind(detail)
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod status_detail_tests {
+    use super::*;
+
+    #[test]
+    fn manual_wording_is_exactly_what_existing_links_have_always_recorded() {
+        for label in ["an invoice", "a contract", "a manifest", "a weight ticket"] {
+            assert_eq!(
+                manual_link_detail(label),
+                format!("data entered manually and linked to {label}")
+            );
+        }
+        assert_eq!(
+            manual_link_detail("an invoice"),
+            "data entered manually and linked to an invoice"
+        );
+    }
+
+    #[test]
+    fn confirmed_extraction_wording_never_claims_manual_entry() {
+        let d = CONFIRMED_EXTRACTION_DETAIL.to_lowercase();
+        assert!(!d.contains("manual"), "{d}");
+        assert!(d.contains("extracted") && d.contains("confirmed"), "{d}");
+        assert_ne!(
+            CONFIRMED_EXTRACTION_DETAIL,
+            manual_link_detail("an invoice")
+        );
+    }
 }
